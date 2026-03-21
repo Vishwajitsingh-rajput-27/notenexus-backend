@@ -3,7 +3,7 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // Use gemini-pro — works with all versions of the package
-const flashModel = genAI.getGenerativeModel({ model: 'gemini-pro' });
+const flashModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash-latest' });
 const embedModel = genAI.getGenerativeModel({ model: 'embedding-001' });
 
 const extractJSON = (raw, type = 'array') => {
