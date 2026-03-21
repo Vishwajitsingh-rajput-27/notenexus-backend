@@ -5,37 +5,68 @@ const https = require('https');
 const http  = require('http');
 const { URL } = require('url');
 
+// ── Fetch file buffer from any URL ────────────────────────────────────────────
 const fetchBuffer = (urlStr) => new Promise((resolve, reject) => {
   try {
     const parsed = new URL(urlStr);
     const lib = parsed.protocol === 'https:' ? https : http;
-    lib.get(urlStr, (res) => {
+
+    const request = lib.get(urlStr, (res) => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        return fetchBuffer(res.headers.location).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        if (buffer.length === 0) return reject(new Error('Downloaded file is empty'));
+        resolve(buffer);
+      });
       res.on('error', reject);
-    }).on('error', reject);
+    });
+
+    request.on('error', reject);
+    request.setTimeout(30000, () => {
+      request.destroy();
+      reject(new Error('Request timeout'));
+    });
   } catch (e) { reject(e); }
 });
 
+// ── Image → Text (Tesseract OCR) ──────────────────────────────────────────────
+const extractFromImage = async (imageUrl) => {
+  try {
+    const { data: { text } } = await Tesseract.recognize(imageUrl, 'eng', {
+      logger: () => {},
+    });
+    return text.trim() || 'No text found in image';
+  } catch (err) {
+    console.error('OCR error:', err.message);
+    return 'Could not extract text from image';
+  }
+};
+
+// ── PDF → Text ────────────────────────────────────────────────────────────────
 const extractFromPDF = async (pdfUrl) => {
   try {
-    // Fetch the PDF buffer from Cloudinary URL
     const buffer = await fetchBuffer(pdfUrl);
-    
+
     if (!buffer || buffer.length === 0) {
       throw new Error('PDF file is empty or could not be downloaded');
     }
 
-    console.log('PDF buffer size:', buffer.length);
+    console.log('PDF buffer size:', buffer.length, 'bytes');
 
     const data = await pdfParse(buffer);
     const text = data.text.trim();
-    
+
     if (!text) {
       return 'PDF was processed but no text could be extracted. The PDF may contain only images.';
     }
-    
+
     return text;
   } catch (err) {
     console.error('PDF error:', err.message);
@@ -43,25 +74,13 @@ const extractFromPDF = async (pdfUrl) => {
   }
 };
 
-const extractFromPDF = async (pdfUrl) => {
-  try {
-    const buffer = await fetchBuffer(pdfUrl);
-    const data = await pdfParse(buffer);
-    return data.text.trim() || 'No text found in PDF';
-  } catch (err) {
-    console.error('PDF error:', err.message);
-    throw new Error('Could not read PDF file');
-  }
-};
-
+// ── YouTube → Transcript ──────────────────────────────────────────────────────
 const extractFromYouTube = async (url) => {
   try {
-    // Extract video ID
     const match = url.match(/(?:v=|youtu\.be\/|embed\/)([^&?/\s]{11})/);
     if (!match) throw new Error('Invalid YouTube URL');
     const videoId = match[1];
 
-    // Try youtube-transcript package
     try {
       const { YoutubeTranscript } = require('youtube-transcript');
       const transcript = await YoutubeTranscript.fetchTranscript(videoId);
@@ -72,14 +91,14 @@ const extractFromYouTube = async (url) => {
       console.error('youtube-transcript failed:', e.message);
     }
 
-    // Fallback — return video ID as note
-    return `YouTube video ID: ${videoId}. Transcript could not be fetched automatically. Please add notes manually.`;
+    return `YouTube video ID: ${videoId}. Transcript could not be fetched. Please add notes manually.`;
   } catch (err) {
     console.error('YouTube error:', err.message);
     return 'Could not fetch YouTube transcript. Please try a different video.';
   }
 };
 
+// ── Voice → Text (Gemini multimodal) ─────────────────────────────────────────
 const extractFromVoice = async (audioUrl) => {
   try {
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -99,12 +118,7 @@ const extractFromVoice = async (audioUrl) => {
     const mimeType = mimeMap[ext] || 'audio/mpeg';
 
     const result = await model.generateContent([
-      {
-        inlineData: {
-          mimeType,
-          data: base64Audio,
-        },
-      },
+      { inlineData: { mimeType, data: base64Audio } },
       'Please transcribe this audio recording into text. Return only the spoken words.',
     ]);
 
