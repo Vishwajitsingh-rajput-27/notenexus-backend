@@ -70,26 +70,35 @@ const extractFromYouTube = async (url) => {
 const extractFromVoice = async (audioUrl) => {
   try {
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const model = genAI.getGenerativeModel({ model: 'gemini-pro-vision' });
+    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash-latest' });
 
     const buffer = await fetchBuffer(audioUrl);
     const base64Audio = buffer.toString('base64');
 
     const ext = audioUrl.split('.').pop().toLowerCase().split('?')[0];
     const mimeMap = {
-      mp3: 'audio/mpeg', wav: 'audio/wav',
-      m4a: 'audio/mp4', webm: 'audio/webm',
+      mp3: 'audio/mpeg',
+      wav: 'audio/wav',
+      m4a: 'audio/mp4',
+      webm: 'audio/webm',
+      ogg: 'audio/ogg',
     };
     const mimeType = mimeMap[ext] || 'audio/mpeg';
 
     const result = await model.generateContent([
-      { inlineData: { mimeType, data: base64Audio } },
-      'Transcribe this audio. Return only the words spoken.',
+      {
+        inlineData: {
+          mimeType,
+          data: base64Audio,
+        },
+      },
+      'Please transcribe this audio recording into text. Return only the spoken words.',
     ]);
+
     return result.response.text().trim();
   } catch (err) {
-    console.error('Voice error:', err.message);
-    return 'Could not transcribe audio file';
+    console.error('Voice transcription error:', err.message);
+    return 'Could not transcribe audio. Please try again or use PDF/image instead.';
   }
 };
 
