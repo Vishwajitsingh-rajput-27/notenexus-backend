@@ -18,15 +18,28 @@ const fetchBuffer = (urlStr) => new Promise((resolve, reject) => {
   } catch (e) { reject(e); }
 });
 
-const extractFromImage = async (imageUrl) => {
+const extractFromPDF = async (pdfUrl) => {
   try {
-    const { data: { text } } = await Tesseract.recognize(imageUrl, 'eng', {
-      logger: () => {},
-    });
-    return text.trim() || 'No text found in image';
+    // Fetch the PDF buffer from Cloudinary URL
+    const buffer = await fetchBuffer(pdfUrl);
+    
+    if (!buffer || buffer.length === 0) {
+      throw new Error('PDF file is empty or could not be downloaded');
+    }
+
+    console.log('PDF buffer size:', buffer.length);
+
+    const data = await pdfParse(buffer);
+    const text = data.text.trim();
+    
+    if (!text) {
+      return 'PDF was processed but no text could be extracted. The PDF may contain only images.';
+    }
+    
+    return text;
   } catch (err) {
-    console.error('OCR error:', err.message);
-    return 'Could not extract text from image';
+    console.error('PDF error:', err.message);
+    throw new Error('Could not read PDF: ' + err.message);
   }
 };
 
