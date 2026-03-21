@@ -1,39 +1,3 @@
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
-// Use gemini-pro — works with all versions of the package
-const flashModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash-latest' });
-const embedModel = genAI.getGenerativeModel({ model: 'embedding-001' });
-
-const extractJSON = (raw, type = 'array') => {
-  try {
-    raw = raw.replace(/```json|```/gi, '').trim();
-    if (type === 'array') {
-      const s = raw.indexOf('['), e = raw.lastIndexOf(']');
-      if (s !== -1 && e !== -1) return JSON.parse(raw.slice(s, e + 1));
-    } else {
-      const s = raw.indexOf('{'), e = raw.lastIndexOf('}');
-      if (s !== -1 && e !== -1) return JSON.parse(raw.slice(s, e + 1));
-    }
-    return JSON.parse(raw);
-  } catch { return type === 'array' ? [] : {}; }
-};
-
-const detectSubjectChapter = async (text) => {
-  try {
-    const result = await flashModel.generateContent(
-      `Analyse this student note. Return ONLY valid JSON object, no markdown:
-{"subject":"Physics","chapter":"Newton Laws","keywords":["force","mass","acceleration","inertia","velocity"]}
-Note: ${text.slice(0, 1200)}`
-    );
-    const parsed = extractJSON(result.response.text(), 'object');
-    if (parsed && parsed.subject) return parsed;
-    return { subject: 'General', chapter: 'Uncategorized', keywords: [] };
-  } catch (err) {
-    console.error('detectSubjectChapter error:', err.message);
-    return { subject: 'General', chapter: 'Uncategorized', keywords: [] };
-  }
 };
 
 const generateSummary = async (text) => {
