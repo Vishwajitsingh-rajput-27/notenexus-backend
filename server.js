@@ -3,6 +3,7 @@ require('dotenv').config();
 const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
 dns.setServers(['8.8.8.8', '8.8.4.4']);
+
 const express    = require('express');
 const http       = require('http');
 const { Server } = require('socket.io');
@@ -18,19 +19,30 @@ const notesRoutes    = require('./routes/notes');
 const searchRoutes   = require('./routes/search');
 const revisionRoutes = require('./routes/revision');
 
-// ── App setup ──────────────────────────────────────────────────────────────
 const app    = express();
 const server = http.createServer(app);
 
-const FRONTEND = process.env.FRONTEND_URL || 'http://localhost:3000';
+// ── CORS — allow everything ────────────────────────────────────────────────
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,PATCH,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
+  res.header('Access-Control-Allow-Credentials', 'false');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
 
+app.use(cors({ origin: '*', credentials: false }));
+
+// ── Socket.io ──────────────────────────────────────────────────────────────
 const io = new Server(server, {
-  cors: { origin: [FRONTEND, 'http://localhost:3000', 'http://localhost:3001'], methods: ['GET', 'POST'], credentials: true },
+  cors: { origin: '*', methods: ['GET', 'POST'] },
 });
 
 // ── Middleware ─────────────────────────────────────────────────────────────
-app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(cors({ origin: [FRONTEND, 'http://localhost:3000', 'http://localhost:3001'], credentials: true }));
+app.use(helmet({ crossOriginResourcePolicy: false, contentSecurityPolicy: false }));
 app.use(morgan('dev'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
@@ -41,9 +53,12 @@ app.use('/api/notes',    notesRoutes);
 app.use('/api/search',   searchRoutes);
 app.use('/api/revision', revisionRoutes);
 
-app.get('/', (req, res) => res.json({ message: 'NoteNexus API running! 📚', version: '1.0.0', docs: '/api' }));
+app.get('/', (req, res) => res.json({ 
+  message: 'NoteNexus API running! 📚', 
+  version: '1.0.0' 
+}));
 
-// ── Socket.io ──────────────────────────────────────────────────────────────
+// ── Socket ─────────────────────────────────────────────────────────────────
 setupSocket(io);
 
 // ── Error handler ──────────────────────────────────────────────────────────
