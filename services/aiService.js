@@ -2,10 +2,13 @@ const https = require('https');
 
 const KEY = () => process.env.GEMINI_API_KEY;
 
+// ── Gemini text generation — stable free-tier models only ─────────────────────
+// gemini-1.5-flash is the most reliable free tier model
+// gemini-1.5-pro as backup (slower but more capable)
+// REMOVED: gemini-2.0-flash (hits quota instantly on free tier)
 const geminiCall = (prompt) => new Promise((resolve, reject) => {
-  // Using gemini-2.0-flash — confirmed available from API key test
-  const models = ['gemini-2.0-flash', 'gemini-flash-latest', 'gemini-2.5-flash'];
-  
+  const models = ['gemini-1.5-flash', 'gemini-1.5-pro'];
+
   const tryModel = (index) => {
     if (index >= models.length) return reject(new Error('All models failed'));
     const model = models[index];
@@ -49,27 +52,39 @@ const geminiCall = (prompt) => new Promise((resolve, reject) => {
   tryModel(0);
 });
 
+// ── Gemini embeddings — text-embedding-004 produces 768-dim vectors ───────────
 const geminiEmbed = (text) => new Promise((resolve) => {
-  // Using text-embedding-004 — confirmed available from API key test
+  // text-embedding-004 is the correct model for 768-dim vectors (matches Pinecone index)
+  // embedding-001 produces 768-dim too — good fallback
   const models = ['text-embedding-004', 'embedding-001'];
-  const body = JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } });
 
   const tryModel = (index) => {
     if (index >= models.length) {
-      console.warn('All embedding models failed — using fallback');
+      console.warn('All embedding models failed — using deterministic fallback');
+      // Deterministic fallback so notes still save (search won't work but upload does)
       return resolve(new Array(768).fill(0).map((_, i) => {
         let h = 0;
         const str = text.slice(0, 50) + i;
-        for (let j = 0; j < str.length; j++) { h = ((h << 5) - h) + str.charCodeAt(j); h |= 0; }
+        for (let j = 0; j < str.length; j++) {
+          h = ((h << 5) - h) + str.charCodeAt(j);
+          h |= 0;
+        }
         return (h % 1000) / 1000;
       }));
     }
+
+    const body = JSON.stringify({
+      content: { parts: [{ text: text.slice(0, 8000) }] }
+    });
 
     const options = {
       hostname: 'generativelanguage.googleapis.com',
       path: `/v1beta/models/${models[index]}:embedContent?key=${KEY()}`,
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
     };
 
     const req = https.request(options, (res) => {
@@ -78,13 +93,18 @@ const geminiEmbed = (text) => new Promise((resolve) => {
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          if (parsed.error || !parsed.embedding) return tryModel(index + 1);
+          if (parsed.error) {
+            console.error(`Embedding model ${models[index]} failed:`, parsed.error.message);
+            return tryModel(index + 1);
+          }
+          if (!parsed.embedding?.values) return tryModel(index + 1);
           console.log(`✅ Embedding model ${models[index]} succeeded`);
           resolve(parsed.embedding.values);
         } catch { tryModel(index + 1); }
       });
     });
     req.on('error', () => tryModel(index + 1));
+    req.setTimeout(15000, () => { req.destroy(); tryModel(index + 1); });
     req.write(body);
     req.end();
   };
@@ -92,6 +112,7 @@ const geminiEmbed = (text) => new Promise((resolve) => {
   tryModel(0);
 });
 
+// ── JSON extraction helper ────────────────────────────────────────────────────
 const extractJSON = (raw, type = 'array') => {
   try {
     raw = (raw || '').replace(/```json|```/gi, '').trim();
@@ -106,10 +127,14 @@ const extractJSON = (raw, type = 'array') => {
   } catch { return type === 'array' ? [] : {}; }
 };
 
+// ── Detect subject + chapter from note text ───────────────────────────────────
 const detectSubjectChapter = async (text) => {
   try {
+    if (!text || text.trim().length < 10) {
+      return { subject: 'General', chapter: 'Uncategorized', keywords: [] };
+    }
     const raw = await geminiCall(
-      `Analyse this student note. Return ONLY valid JSON no markdown:
+      `Analyse this student note. Return ONLY valid JSON, no markdown, no explanation:
 {"subject":"Physics","chapter":"Newton Laws","keywords":["force","mass","acceleration","inertia","velocity"]}
 Note: ${text.slice(0, 1200)}`
     );
@@ -122,6 +147,7 @@ Note: ${text.slice(0, 1200)}`
   }
 };
 
+// ── Generate study summary ────────────────────────────────────────────────────
 const generateSummary = async (text) => {
   try {
     return await geminiCall(`Create a study summary with:
@@ -134,10 +160,11 @@ Notes: ${text.slice(0, 4000)}`);
   }
 };
 
+// ── Generate flashcards ───────────────────────────────────────────────────────
 const generateFlashcards = async (text) => {
   try {
     const raw = await geminiCall(`Create 10 flashcards from these notes.
-Return ONLY a JSON array no markdown no explanation.
+Return ONLY a JSON array, no markdown, no explanation.
 Format: [{"question":"...","answer":"..."}]
 Notes: ${text.slice(0, 4000)}`);
     const parsed = extractJSON(raw, 'array');
@@ -149,10 +176,11 @@ Notes: ${text.slice(0, 4000)}`);
   }
 };
 
+// ── Generate practice questions ───────────────────────────────────────────────
 const generateQuestions = async (text) => {
   try {
     const raw = await geminiCall(`Generate 10 exam practice questions.
-Return ONLY a JSON array no markdown no explanation.
+Return ONLY a JSON array, no markdown, no explanation.
 Format: [{"question":"...","type":"short_answer","hint":"..."}]
 Notes: ${text.slice(0, 4000)}`);
     const parsed = extractJSON(raw, 'array');
@@ -164,10 +192,11 @@ Notes: ${text.slice(0, 4000)}`);
   }
 };
 
+// ── Generate mind map ─────────────────────────────────────────────────────────
 const generateMindmap = async (text) => {
   try {
     const raw = await geminiCall(`Create a mind map from these notes.
-Return ONLY a JSON object no markdown no explanation.
+Return ONLY a JSON object, no markdown, no explanation.
 Format: {"root":"Main Topic","children":[{"label":"Subtopic","children":[{"label":"Detail"}]}]}
 Notes: ${text.slice(0, 3000)}`);
     const parsed = extractJSON(raw, 'object');
@@ -179,6 +208,7 @@ Notes: ${text.slice(0, 3000)}`);
   }
 };
 
+// ── Create embedding vector ───────────────────────────────────────────────────
 const createEmbedding = async (text) => {
   return await geminiEmbed(text);
 };
