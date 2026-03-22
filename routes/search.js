@@ -1,6 +1,6 @@
 const express      = require('express');
 const asyncHandler = require('express-async-handler');
-const { protect }  = require('../middleware/auth');
+const auth = require('../middleware/auth');
 const { semanticSearch } = require('../services/vectorService');
 
 const router = express.Router();
