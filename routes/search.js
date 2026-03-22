@@ -4,7 +4,7 @@ const auth = require('../middleware/auth');
 const { semanticSearch } = require('../services/vectorService');
 
 const router = express.Router();
-router.use(protect);
+router.use(auth);
 
 // POST /api/search
 router.post('/', asyncHandler(async (req, res) => {
