@@ -7,7 +7,7 @@ const KEY = () => process.env.GEMINI_API_KEY;
 // gemini-1.5-pro as backup (slower but more capable)
 // REMOVED: gemini-2.0-flash (hits quota instantly on free tier)
 const geminiCall = (prompt) => new Promise((resolve, reject) => {
-  const models = ['gemini-1.5-flash', 'gemini-1.5-pro'];
+  const models = ['gemini-2.0-flash', 'gemini-flash-latest'];
 
   const tryModel = (index) => {
     if (index >= models.length) return reject(new Error('All models failed'));
