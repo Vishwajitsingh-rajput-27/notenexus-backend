@@ -2,20 +2,10 @@ const https = require('https');
 
 const KEY = () => process.env.GEMINI_API_KEY;
 
-// Direct REST call — v1beta with gemini-1.5-flash-001
 const geminiCall = (prompt) => new Promise((resolve, reject) => {
-  const body = JSON.stringify({
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: { temperature: 0.3, maxOutputTokens: 2048 }
-  });
-
-  // Try models in order
-  const models = [
-    'gemini-1.5-flash-001',
-    'gemini-1.5-flash',
-    'gemini-1.0-pro',
-  ];
-
+  // Using gemini-2.0-flash — confirmed available from API key test
+  const models = ['gemini-2.0-flash', 'gemini-flash-latest', 'gemini-2.5-flash'];
+  
   const tryModel = (index) => {
     if (index >= models.length) return reject(new Error('All models failed'));
     const model = models[index];
@@ -45,7 +35,7 @@ const geminiCall = (prompt) => new Promise((resolve, reject) => {
             return tryModel(index + 1);
           }
           const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text || '';
-          console.log(`Model ${model} succeeded`);
+          console.log(`✅ Model ${model} succeeded`);
           resolve(text);
         } catch (e) { tryModel(index + 1); }
       });
@@ -59,10 +49,10 @@ const geminiCall = (prompt) => new Promise((resolve, reject) => {
   tryModel(0);
 });
 
-// Embedding with fallback
 const geminiEmbed = (text) => new Promise((resolve) => {
-  const body = JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } });
+  // Using text-embedding-004 — confirmed available from API key test
   const models = ['text-embedding-004', 'embedding-001'];
+  const body = JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } });
 
   const tryModel = (index) => {
     if (index >= models.length) {
@@ -89,7 +79,7 @@ const geminiEmbed = (text) => new Promise((resolve) => {
         try {
           const parsed = JSON.parse(data);
           if (parsed.error || !parsed.embedding) return tryModel(index + 1);
-          console.log(`Embedding model ${models[index]} succeeded`);
+          console.log(`✅ Embedding model ${models[index]} succeeded`);
           resolve(parsed.embedding.values);
         } catch { tryModel(index + 1); }
       });
