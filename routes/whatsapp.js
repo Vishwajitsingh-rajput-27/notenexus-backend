@@ -37,7 +37,7 @@ router.post('/webhook', express.urlencoded({ extended: false }), async (req, res
     const text = Body.trim();
     const lower = text.toLowerCase();
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+   const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
 
     let prompt;
     if (lower.startsWith('summary:')) {
