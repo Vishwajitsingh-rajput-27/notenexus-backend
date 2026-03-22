@@ -2,8 +2,9 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// gemini-pro for text generation
-const flashModel = genAI.getGenerativeModel({ model: 'gemini-pro' });
+// gemini-1.5-flash works with @google/generative-ai v0.21.0+
+const flashModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+const embedModel = genAI.getGenerativeModel({ model: 'text-embedding-004' });
 
 const extractJSON = (raw, type = 'array') => {
   try {
@@ -117,40 +118,23 @@ Notes: ${text.slice(0, 3000)}`
   }
 };
 
-// ── Embedding — use simple hash fallback if Gemini embedding fails ────────────
 const createEmbedding = async (text) => {
-  // Try models in order until one works
-  const embeddingModels = [
-    'models/embedding-001',
-    'embedding-001',
-    'models/text-embedding-004',
-    'text-embedding-004',
-  ];
-
-  for (const modelName of embeddingModels) {
-    try {
-      const embModel = genAI.getGenerativeModel({ model: modelName });
-      const result = await embModel.embedContent(text.slice(0, 8000));
-      console.log('Embedding model worked:', modelName);
-      return result.embedding.values;
-    } catch (err) {
-      console.error(`Embedding model ${modelName} failed:`, err.message);
-    }
+  try {
+    const result = await embedModel.embedContent(text.slice(0, 8000));
+    return result.embedding.values;
+  } catch (err) {
+    console.error('createEmbedding error:', err.message);
+    // Fallback pseudo-embedding so upload still works
+    return new Array(768).fill(0).map((_, i) => {
+      let h = 0;
+      const str = text.slice(0, 50) + i;
+      for (let j = 0; j < str.length; j++) {
+        h = ((h << 5) - h) + str.charCodeAt(j);
+        h |= 0;
+      }
+      return (h % 1000) / 1000;
+    });
   }
-
-  // Final fallback — generate a deterministic pseudo-embedding
-  // This allows upload to succeed even if all embedding models fail
-  console.warn('All embedding models failed — using fallback pseudo-embedding');
-  const fallback = new Array(768).fill(0).map((_, i) => {
-    let hash = 0;
-    const str = text.slice(0, 100) + i;
-    for (let j = 0; j < str.length; j++) {
-      hash = ((hash << 5) - hash) + str.charCodeAt(j);
-      hash |= 0;
-    }
-    return (hash % 1000) / 1000;
-  });
-  return fallback;
 };
 
 module.exports = {
