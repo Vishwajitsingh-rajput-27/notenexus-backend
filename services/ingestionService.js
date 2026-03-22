@@ -1,7 +1,7 @@
 const pdfParse = require('pdf-parse');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const https = require('https');
-const http = require('http');
+const http  = require('http');
 const { URL } = require('url');
 
 // ── Gemini client — always use gemini-1.5-flash (stable free tier) ────────────
@@ -22,7 +22,7 @@ const fetchBuffer = (urlStr) =>
           return fetchBuffer(res.headers.location).then(resolve).catch(reject);
         }
         if (res.statusCode !== 200) {
-          return reject(new Error(`HTTP ${res.statusCode}`));
+          return reject(new Error(`HTTP ${res.statusCode} fetching file`));
         }
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
@@ -37,157 +37,156 @@ const fetchBuffer = (urlStr) =>
       request.on('error', reject);
       request.setTimeout(30000, () => {
         request.destroy();
-        reject(new Error('Request timeout'));
+        reject(new Error('Request timeout fetching file'));
       });
     } catch (e) {
       reject(e);
     }
   });
 
-// ── Image → Text (Gemini Vision — replaces Tesseract) ────────────────────────
-const extractFromImage = async (imageUrl) => {
-  try {
-    const model = getModel();
-    const buffer = await fetchBuffer(imageUrl);
-    const base64Image = buffer.toString('base64');
-
-    // Detect mime type from URL extension
-    const ext = imageUrl.split('.').pop().toLowerCase().split('?')[0];
-    const mimeMap = {
-      jpg: 'image/jpeg',
-      jpeg: 'image/jpeg',
-      png: 'image/png',
-      gif: 'image/gif',
-      webp: 'image/webp',
-    };
-    const mimeType = mimeMap[ext] || 'image/jpeg';
-
-    const result = await model.generateContent([
-      {
-        inlineData: {
-          mimeType,
-          data: base64Image,
-        },
-      },
-      'Extract and transcribe ALL text visible in this image. Return only the text content, preserving structure where possible.',
-    ]);
-
-    const text = result.response.text().trim();
-    return text || 'No text found in image';
-  } catch (err) {
-    console.error('Image OCR error:', err.message);
-    return 'Could not extract text from image. Please try a clearer image.';
+// ── Validate extracted text — throws if result is empty or too short ──────────
+const validateText = (text, source) => {
+  if (!text || typeof text !== 'string') {
+    throw new Error(`No text returned from ${source}`);
   }
+  const trimmed = text.trim();
+  if (trimmed.length < 10) {
+    throw new Error(`Extracted text too short from ${source}`);
+  }
+  return trimmed;
+};
+
+// ── Image → Text (Gemini Vision) ──────────────────────────────────────────────
+const extractFromImage = async (imageUrl) => {
+  console.log('extractFromImage called with:', imageUrl);
+  const model = getModel();
+  const buffer = await fetchBuffer(imageUrl);
+  console.log('Image buffer size:', buffer.length, 'bytes');
+
+  const base64Image = buffer.toString('base64');
+
+  const ext = imageUrl.split('.').pop().toLowerCase().split('?')[0];
+  const mimeMap = {
+    jpg: 'image/jpeg', jpeg: 'image/jpeg',
+    png: 'image/png', gif: 'image/gif', webp: 'image/webp',
+  };
+  const mimeType = mimeMap[ext] || 'image/jpeg';
+  console.log('Image mimeType:', mimeType);
+
+  const result = await model.generateContent([
+    { inlineData: { mimeType, data: base64Image } },
+    'Extract and transcribe ALL text visible in this image. Return only the text content, preserving structure where possible.',
+  ]);
+
+  const text = result.response.text();
+  console.log('Gemini image extraction result length:', text?.length);
+  return validateText(text, 'image');
 };
 
 // ── PDF → Text (pdf-parse first, Gemini Vision fallback for scanned PDFs) ─────
 const extractFromPDF = async (pdfUrl) => {
+  console.log('extractFromPDF called with:', pdfUrl);
+  const buffer = await fetchBuffer(pdfUrl);
+  console.log('PDF buffer size:', buffer.length, 'bytes');
+
+  // Try pdf-parse first (fast, works for text-based PDFs)
   try {
-    const buffer = await fetchBuffer(pdfUrl);
-    if (!buffer || buffer.length === 0) throw new Error('PDF file is empty');
-
-    console.log('PDF buffer size:', buffer.length, 'bytes');
-
     const data = await pdfParse(buffer);
-    const text = data.text.trim();
-
+    const text = data.text?.trim();
     if (text && text.length > 50) {
+      console.log('pdf-parse succeeded, text length:', text.length);
       return text;
     }
-
-    // Fallback: treat as scanned PDF — send to Gemini Vision
-    console.log('PDF has no selectable text — using Gemini Vision fallback');
-    const base64PDF = buffer.toString('base64');
-    const model = getModel();
-
-    const result = await model.generateContent([
-      {
-        inlineData: {
-          mimeType: 'application/pdf',
-          data: base64PDF,
-        },
-      },
-      'Extract and transcribe ALL text from this PDF document. Return only the text content.',
-    ]);
-
-    return result.response.text().trim() || 'Could not extract text from this PDF.';
-  } catch (err) {
-    console.error('PDF error:', err.message);
-    throw new Error('Could not read PDF: ' + err.message);
+    console.log('pdf-parse returned no text — trying Gemini Vision fallback');
+  } catch (parseErr) {
+    console.error('pdf-parse error:', parseErr.message, '— trying Gemini Vision fallback');
   }
+
+  // Fallback: scanned PDF — send to Gemini Vision as base64
+  const base64PDF = buffer.toString('base64');
+  const model = getModel();
+
+  const result = await model.generateContent([
+    { inlineData: { mimeType: 'application/pdf', data: base64PDF } },
+    'Extract and transcribe ALL text from this PDF document. Return only the text content.',
+  ]);
+
+  const text = result.response.text();
+  console.log('Gemini PDF extraction result length:', text?.length);
+  return validateText(text, 'PDF');
 };
 
-// ── YouTube → Transcript (fixed ES module bug — uses dynamic import) ──────────
+// ── YouTube → Transcript ──────────────────────────────────────────────────────
 const extractFromYouTube = async (url) => {
+  console.log('extractFromYouTube called with:', url);
+  const match = url.match(/(?:v=|youtu\.be\/|embed\/)([^&?/\s]{11})/);
+  if (!match) throw new Error('Invalid YouTube URL — could not extract video ID');
+  const videoId = match[1];
+  console.log('YouTube video ID:', videoId);
+
+  // Method 1: youtubei.js — mimics real browser, most reliable
   try {
-    const match = url.match(/(?:v=|youtu\.be\/|embed\/)([^&?/\s]{11})/);
-    if (!match) throw new Error('Invalid YouTube URL');
-    const videoId = match[1];
-
-    // FIX: youtube-transcript is ESM — must use dynamic import() not require()
-    try {
-      const { YoutubeTranscript } = await import('youtube-transcript');
-      const transcript = await YoutubeTranscript.fetchTranscript(videoId);
-      if (transcript && transcript.length > 0) {
-        return transcript.map((t) => t.text).join(' ').trim();
+    const { Innertube } = await import('youtubei.js');
+    const yt = await Innertube.create({ retrieve_player: false });
+    const info = await yt.getInfo(videoId);
+    const transcriptData = await info.getTranscript();
+    const segments = transcriptData?.transcript?.content?.body?.initial_segments;
+    if (segments && segments.length > 0) {
+      const text = segments.map((s) => s.snippet?.text || '').filter(Boolean).join(' ').trim();
+      if (text.length > 20) {
+        console.log('youtubei.js transcript length:', text.length);
+        return text;
       }
-    } catch (e) {
-      console.error('youtube-transcript failed:', e.message);
     }
-
-    // Fallback: ask Gemini to summarise from video ID (metadata only)
-    try {
-      const model = getModel();
-      const result = await model.generateContent(
-        `The YouTube video ID is "${videoId}" (URL: ${url}). ` +
-        `I could not fetch the transcript automatically. ` +
-        `Please write a note explaining that the transcript was unavailable and suggest the user paste the video content manually.`
-      );
-      return result.response.text().trim();
-    } catch (geminiErr) {
-      console.error('Gemini fallback error:', geminiErr.message);
-    }
-
-    return `YouTube video ID: ${videoId}. Transcript could not be fetched automatically. Please paste the content manually.`;
-  } catch (err) {
-    console.error('YouTube error:', err.message);
-    return 'Could not fetch YouTube transcript. Please try a different video or paste content manually.';
+  } catch (e) {
+    console.error('youtubei.js failed:', e.message);
   }
+
+  // Method 2: youtube-transcript (ESM — dynamic import required)
+  try {
+    const { YoutubeTranscript } = await import('youtube-transcript');
+    const transcript = await YoutubeTranscript.fetchTranscript(videoId);
+    if (transcript && transcript.length > 0) {
+      const text = transcript.map((t) => t.text).join(' ').trim();
+      console.log('youtube-transcript length:', text.length);
+      return text;
+    }
+  } catch (e) {
+    console.error('youtube-transcript failed:', e.message);
+  }
+
+  // Both failed — throw a clear error so the frontend shows a useful message
+  throw new Error(
+    `Could not fetch transcript for YouTube video ${videoId}. ` +
+    `The video may not have captions enabled. ` +
+    `Open YouTube → click ··· under the video → "Show transcript" → copy and paste it manually.`
+  );
 };
 
 // ── Voice → Text (Gemini multimodal audio) ───────────────────────────────────
 const extractFromVoice = async (audioUrl) => {
-  try {
-    const model = getModel();
-    const buffer = await fetchBuffer(audioUrl);
-    const base64Audio = buffer.toString('base64');
+  console.log('extractFromVoice called with:', audioUrl);
+  const model = getModel();
+  const buffer = await fetchBuffer(audioUrl);
+  console.log('Audio buffer size:', buffer.length, 'bytes');
 
-    const ext = audioUrl.split('.').pop().toLowerCase().split('?')[0];
-    const mimeMap = {
-      mp3: 'audio/mpeg',
-      wav: 'audio/wav',
-      m4a: 'audio/mp4',
-      webm: 'audio/webm',
-      ogg: 'audio/ogg',
-      aac: 'audio/aac',
-    };
-    const mimeType = mimeMap[ext] || 'audio/mpeg';
+  const base64Audio = buffer.toString('base64');
+  const ext = audioUrl.split('.').pop().toLowerCase().split('?')[0];
+  const mimeMap = {
+    mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4',
+    webm: 'audio/webm', ogg: 'audio/ogg', aac: 'audio/aac',
+  };
+  const mimeType = mimeMap[ext] || 'audio/mpeg';
+  console.log('Audio mimeType:', mimeType);
 
-    const result = await model.generateContent([
-      {
-        inlineData: {
-          mimeType,
-          data: base64Audio,
-        },
-      },
-      'Please transcribe this audio recording into text. Return only the spoken words, no timestamps or labels.',
-    ]);
+  const result = await model.generateContent([
+    { inlineData: { mimeType, data: base64Audio } },
+    'Please transcribe this audio recording into text. Return only the spoken words, no timestamps or labels.',
+  ]);
 
-    return result.response.text().trim();
-  } catch (err) {
-    console.error('Voice transcription error:', err.message);
-    return 'Could not transcribe audio. Please try again or use PDF/image instead.';
-  }
+  const text = result.response.text();
+  console.log('Gemini voice transcription length:', text?.length);
+  return validateText(text, 'audio');
 };
 
 module.exports = {
