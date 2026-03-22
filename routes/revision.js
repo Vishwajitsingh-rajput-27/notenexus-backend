@@ -1,10 +1,10 @@
 const express      = require('express');
 const asyncHandler = require('express-async-handler');
-const { protect }  = require('../middleware/auth');
+const auth = require('../middleware/auth');
 const { generateSummary, generateFlashcards, generateQuestions, generateMindmap } = require('../services/aiService');
 
 const router = express.Router();
-router.use(protect);
+router.use(auth);
 
 // POST /api/revision
 router.post('/', asyncHandler(async (req, res) => {
