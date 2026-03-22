@@ -8,6 +8,7 @@ const { URL } = require('url');
 const getModel = () => {
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
   return genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+};
 // ── Fetch file buffer from any URL ────────────────────────────────────────────
 const fetchBuffer = (urlStr) =>
   new Promise((resolve, reject) => {
