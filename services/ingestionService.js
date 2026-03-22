@@ -144,9 +144,7 @@ const extractFromPDF = async (pdfUrl) => {
 
   // Fix Cloudinary PDF URLs: /image/upload/ must be /raw/upload/ for PDFs
   const fixedUrl = pdfUrl.replace('/image/upload/', '/raw/upload/');
-  if (fixedUrl !== pdfUrl) {
-    console.log('Fixed Cloudinary PDF URL to:', fixedUrl);
-  }
+  if (fixedUrl !== pdfUrl) console.log('Fixed Cloudinary PDF URL to:', fixedUrl);
 
   const buffer = await fetchBuffer(fixedUrl);
   console.log('PDF buffer size:', buffer.length, 'bytes');
@@ -171,7 +169,7 @@ const extractFromPDF = async (pdfUrl) => {
   return validateText(text, 'PDF');
 };
 
-// ── YouTube → Transcript ──────────────────────────────────────────────────────
+// ── YouTube → Manual Instructions (YouTube blocks cloud server IPs) ───────────
 const extractFromYouTube = async (url) => {
   console.log('extractFromYouTube called with:', url);
   const match = url.match(/(?:v=|youtu\.be\/|embed\/)([^&?/\s]{11})/);
@@ -179,32 +177,20 @@ const extractFromYouTube = async (url) => {
   const videoId = match[1];
   console.log('YouTube video ID:', videoId);
 
-  try {
-    const { Innertube } = await import('youtubei.js');
-    const yt = await Innertube.create({ retrieve_player: false });
-    const info = await yt.getInfo(videoId);
-    const transcriptData = await info.getTranscript();
-    const segments = transcriptData?.transcript?.content?.body?.initial_segments;
-    if (segments && segments.length > 0) {
-      const text = segments.map((s) => s.snippet?.text || '').filter(Boolean).join(' ').trim();
-      if (text.length > 20) { console.log('youtubei.js success, length:', text.length); return text; }
-    }
-  } catch (e) { console.error('youtubei.js failed:', e.message); }
+  // YouTube blocks transcript fetching from cloud server IPs (Render, AWS etc.)
+  // Return helpful manual instructions as the note content instead
+  return `YouTube Video Note
+Video URL: ${url}
 
-  try {
-    const { YoutubeTranscript } = await import('youtube-transcript');
-    const transcript = await YoutubeTranscript.fetchTranscript(videoId);
-    if (transcript && transcript.length > 0) {
-      const text = transcript.map((t) => t.text).join(' ').trim();
-      console.log('youtube-transcript success, length:', text.length);
-      return text;
-    }
-  } catch (e) { console.error('youtube-transcript failed:', e.message); }
+To get the transcript for this video:
+1. Open the video on YouTube
+2. Click the three dots (...) below the video player
+3. Select "Show transcript"
+4. Click the three dots in the transcript panel → turn off "Toggle timestamps"
+5. Select all the transcript text, copy it
+6. Create a new note and paste the transcript there
 
-  throw new Error(
-    `Could not fetch transcript for video ${videoId}. ` +
-    `Open YouTube → click ··· → "Show transcript" → copy and paste manually.`
-  );
+You can also summarise the key points from the video manually and save them as a note.`;
 };
 
 // ── Voice → Text (Groq Whisper) ───────────────────────────────────────────────
