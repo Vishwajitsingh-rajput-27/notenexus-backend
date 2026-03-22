@@ -3,7 +3,7 @@ const jwt     = require('jsonwebtoken');
 const asyncHandler = require('express-async-handler');
 const User    = require('../models/User');
 const Note    = require('../models/Note');
-const { protect } = require('../middleware/auth');
+const protect = require('../middleware/auth');
 
 const router = express.Router();
 
