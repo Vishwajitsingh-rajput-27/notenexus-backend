@@ -16,6 +16,14 @@ const setupSocket = require('./socket');
 // Routes
 const authRoutes     = require('./routes/auth');
 const notesRoutes    = require('./routes/notes');
+const whatsappRoutes = require('./routes/whatsapp');
+const examRoutes     = require('./routes/examPredictor');
+const plannerRoutes  = require('./routes/studyPlanner');
+const reminderRoutes = require('./routes/reminders');
+const tutorRoutes    = require('./routes/tutor');
+const { startReminderCron } = require('./services/reminderService');
+
+
 const searchRoutes   = require('./routes/search');
 const revisionRoutes = require('./routes/revision');
 
@@ -50,6 +58,11 @@ app.use(express.urlencoded({ extended: true }));
 // ── Routes ─────────────────────────────────────────────────────────────────
 app.use('/api/auth',     authRoutes);
 app.use('/api/notes',    notesRoutes);
+app.use('/api/whatsapp',  whatsappRoutes);
+app.use('/api/exam',      examRoutes);
+app.use('/api/planner',   plannerRoutes);
+app.use('/api/reminders', reminderRoutes);
+app.use('/api/tutor',     tutorRoutes);
 app.use('/api/search',   searchRoutes);
 app.use('/api/revision', revisionRoutes);
 
@@ -67,8 +80,9 @@ app.use((err, req, res, next) => {
   res.status(err.status || 500).json({ message: err.message || 'Server error' });
 });
 
-// ── Start ──────────────────────────────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
 connectDB().then(() => {
+  startReminderCron();
   server.listen(PORT, () => console.log(`🚀 NoteNexus server running on port ${PORT}`));
 });
