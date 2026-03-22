@@ -141,7 +141,14 @@ const extractFromImage = async (imageUrl) => {
 // ── PDF → Text (pdf-parse + Groq Vision fallback) ─────────────────────────────
 const extractFromPDF = async (pdfUrl) => {
   console.log('extractFromPDF called with:', pdfUrl);
-  const buffer = await fetchBuffer(pdfUrl);
+
+  // Fix Cloudinary PDF URLs: /image/upload/ must be /raw/upload/ for PDFs
+  const fixedUrl = pdfUrl.replace('/image/upload/', '/raw/upload/');
+  if (fixedUrl !== pdfUrl) {
+    console.log('Fixed Cloudinary PDF URL to:', fixedUrl);
+  }
+
+  const buffer = await fetchBuffer(fixedUrl);
   console.log('PDF buffer size:', buffer.length, 'bytes');
 
   try {
@@ -156,7 +163,6 @@ const extractFromPDF = async (pdfUrl) => {
     console.error('pdf-parse error:', e.message, '— trying Groq Vision');
   }
 
-  // Scanned PDF fallback — send as base64 image to Groq Vision
   const base64PDF = buffer.toString('base64');
   const text = await groqVision(base64PDF, 'image/jpeg',
     'This is a scanned PDF page. Extract and transcribe ALL text you can see. Return only the text content.'
@@ -173,7 +179,6 @@ const extractFromYouTube = async (url) => {
   const videoId = match[1];
   console.log('YouTube video ID:', videoId);
 
-  // Method 1: youtubei.js
   try {
     const { Innertube } = await import('youtubei.js');
     const yt = await Innertube.create({ retrieve_player: false });
@@ -186,7 +191,6 @@ const extractFromYouTube = async (url) => {
     }
   } catch (e) { console.error('youtubei.js failed:', e.message); }
 
-  // Method 2: youtube-transcript
   try {
     const { YoutubeTranscript } = await import('youtube-transcript');
     const transcript = await YoutubeTranscript.fetchTranscript(videoId);
