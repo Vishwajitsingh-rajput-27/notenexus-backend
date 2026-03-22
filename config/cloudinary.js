@@ -8,13 +8,16 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
+// PDFs must use resource_type 'raw', images/audio use 'auto'
 const storage = new CloudinaryStorage({
   cloudinary,
-  params: {
-    folder: 'notenexus',
-    resource_type: 'auto',
-    access_mode: 'public',
-    allowed_formats: ['pdf', 'jpg', 'jpeg', 'png', 'webp', 'mp3', 'wav', 'm4a', 'webm'],
+  params: async (req, file) => {
+    const isPDF = file.mimetype === 'application/pdf';
+    return {
+      folder: 'notenexus',
+      resource_type: isPDF ? 'raw' : 'auto',
+      allowed_formats: ['pdf', 'jpg', 'jpeg', 'png', 'webp', 'mp3', 'wav', 'm4a', 'webm'],
+    };
   },
 });
 
