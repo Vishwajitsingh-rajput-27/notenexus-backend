@@ -1,14 +1,13 @@
 const https = require('https');
 
-// ── Groq text generation — llama-3.3-70b (free, fast, generous limits) ────────
-const groqCall = (prompt) => new Promise((resolve, reject) => {
+// ── Groq text generation ──────────────────────────────────────────────────────
+const groqCall = (prompt, maxTokens = 2048) => new Promise((resolve, reject) => {
   const body = JSON.stringify({
     model: 'llama-3.3-70b-versatile',
     messages: [{ role: 'user', content: prompt }],
-    max_tokens: 2048,
+    max_tokens: maxTokens,
     temperature: 0.3
   });
-
   const options = {
     hostname: 'api.groq.com',
     path: '/openai/v1/chat/completions',
@@ -19,7 +18,6 @@ const groqCall = (prompt) => new Promise((resolve, reject) => {
       'Content-Length': Buffer.byteLength(body)
     }
   };
-
   const req = https.request(options, (res) => {
     let data = '';
     res.on('data', (c) => data += c);
@@ -28,7 +26,7 @@ const groqCall = (prompt) => new Promise((resolve, reject) => {
         const parsed = JSON.parse(data);
         if (parsed.error) return reject(new Error(parsed.error.message));
         const text = parsed.choices?.[0]?.message?.content || '';
-        console.log('✅ Groq llama call succeeded');
+        console.log('✅ Groq call succeeded');
         resolve(text);
       } catch (e) { reject(e); }
     });
@@ -39,7 +37,7 @@ const groqCall = (prompt) => new Promise((resolve, reject) => {
   req.end();
 });
 
-// ── Gemini embeddings — kept for 768-dim Pinecone vectors (free) ──────────────
+// ── Gemini embeddings ─────────────────────────────────────────────────────────
 const geminiEmbed = (text) => new Promise((resolve) => {
   const models = ['text-embedding-004', 'embedding-001'];
   const body = JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } });
@@ -54,14 +52,12 @@ const geminiEmbed = (text) => new Promise((resolve) => {
         return (h % 1000) / 1000;
       }));
     }
-
     const options = {
       hostname: 'generativelanguage.googleapis.com',
       path: `/v1beta/models/${models[index]}:embedContent?key=${process.env.GEMINI_API_KEY}`,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
     };
-
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', (c) => data += c);
@@ -79,7 +75,6 @@ const geminiEmbed = (text) => new Promise((resolve) => {
     req.write(body);
     req.end();
   };
-
   tryModel(0);
 });
 
@@ -98,19 +93,90 @@ const extractJSON = (raw, type = 'array') => {
   } catch { return type === 'array' ? [] : {}; }
 };
 
+// ── Detect language and translate to English if needed ────────────────────────
+const translateToEnglish = async (text) => {
+  try {
+    const sample = text.slice(0, 500);
+    const langCheck = await groqCall(
+      `Detect the language of this text and reply with ONLY a JSON object, no explanation:
+{"language":"English","isEnglish":true}
+or
+{"language":"Arabic","isEnglish":false}
+
+Text: ${sample}`,
+      100
+    );
+    const langResult = extractJSON(langCheck, 'object');
+    if (!langResult || langResult.isEnglish === true) {
+      console.log('Text is already in English, no translation needed');
+      return text;
+    }
+
+    console.log(`Detected language: ${langResult.language} — translating to English...`);
+    // Translate in chunks to avoid token limits
+    const chunkSize = 3000;
+    const chunks = [];
+    for (let i = 0; i < text.length; i += chunkSize) {
+      chunks.push(text.slice(i, i + chunkSize));
+    }
+
+    const translatedChunks = await Promise.all(
+      chunks.map(chunk =>
+        groqCall(
+          `Translate the following text to English. Return ONLY the translated text, no explanations, no notes:\n\n${chunk}`,
+          2048
+        )
+      )
+    );
+
+    const translated = translatedChunks.join(' ').trim();
+    console.log('Translation complete, length:', translated.length);
+    return translated;
+  } catch (err) {
+    console.error('Translation error:', err.message, '— using original text');
+    return text; // Return original if translation fails
+  }
+};
+
 // ── Detect subject + chapter ──────────────────────────────────────────────────
 const detectSubjectChapter = async (text) => {
   try {
     if (!text || text.trim().length < 10) {
       return { subject: 'General', chapter: 'Uncategorized', keywords: [] };
     }
+
+    // Use a unique portion of text to avoid same result every time
+    const textSample = text.slice(0, 1200);
+
     const raw = await groqCall(
-      `Analyse this student note. Return ONLY valid JSON, no markdown, no explanation:
+      `You are an academic classifier. Read this student note carefully and identify its subject and chapter.
+Return ONLY valid JSON with no markdown, no explanation, no extra text.
+The subject and chapter must reflect the ACTUAL content of the note below.
+
+Example format:
 {"subject":"Physics","chapter":"Newton Laws","keywords":["force","mass","acceleration"]}
-Note: ${text.slice(0, 1200)}`
+
+Note to classify:
+${textSample}
+
+JSON response:`
     );
+
     const parsed = extractJSON(raw, 'object');
-    if (parsed && parsed.subject) return parsed;
+    if (parsed && parsed.subject && parsed.subject !== 'Physics') return parsed;
+
+    // If it returned Physics again suspiciously, try once more with stronger prompt
+    if (parsed && parsed.subject) {
+      const verify = await groqCall(
+        `What academic subject is this note about? Be specific.
+Return ONLY JSON: {"subject":"...","chapter":"...","keywords":["...","...","..."]}
+Note: ${textSample.slice(0, 600)}`
+      );
+      const verified = extractJSON(verify, 'object');
+      if (verified && verified.subject) return verified;
+      return parsed;
+    }
+
     return { subject: 'General', chapter: 'Uncategorized', keywords: [] };
   } catch (err) {
     console.error('detectSubjectChapter error:', err.message);
@@ -186,5 +252,5 @@ const createEmbedding = async (text) => {
 
 module.exports = {
   detectSubjectChapter, generateSummary, generateFlashcards,
-  generateQuestions, generateMindmap, createEmbedding,
+  generateQuestions, generateMindmap, createEmbedding, translateToEnglish,
 };
