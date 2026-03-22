@@ -1,21 +1,15 @@
 const pdfParse = require('pdf-parse');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const https = require('https');
 const http  = require('http');
 const { URL } = require('url');
+const FormData = require('form-data');
 
-// ── Gemini client — always use gemini-1.5-flash (stable free tier) ────────────
-const getModel = () => {
-  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-  return genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-};
 // ── Fetch file buffer from any URL ────────────────────────────────────────────
 const fetchBuffer = (urlStr) =>
   new Promise((resolve, reject) => {
     try {
       const parsed = new URL(urlStr);
       const lib = parsed.protocol === 'https:' ? https : http;
-
       const request = lib.get(urlStr, (res) => {
         if (res.statusCode === 301 || res.statusCode === 302) {
           return fetchBuffer(res.headers.location).then(resolve).catch(reject);
@@ -32,86 +26,142 @@ const fetchBuffer = (urlStr) =>
         });
         res.on('error', reject);
       });
-
       request.on('error', reject);
-      request.setTimeout(30000, () => {
-        request.destroy();
-        reject(new Error('Request timeout fetching file'));
-      });
-    } catch (e) {
-      reject(e);
-    }
+      request.setTimeout(60000, () => { request.destroy(); reject(new Error('Request timeout')); });
+    } catch (e) { reject(e); }
   });
 
-// ── Validate extracted text — throws if result is empty or too short ──────────
+// ── Groq Vision API — for image and scanned PDF ───────────────────────────────
+const groqVision = (base64Data, mimeType, prompt) => new Promise((resolve, reject) => {
+  const body = JSON.stringify({
+    model: 'llama-3.2-11b-vision-preview',
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Data}` } },
+        { type: 'text', text: prompt }
+      ]
+    }],
+    max_tokens: 4096,
+    temperature: 0.1
+  });
+
+  const options = {
+    hostname: 'api.groq.com',
+    path: '/openai/v1/chat/completions',
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body)
+    }
+  };
+
+  const req = https.request(options, (res) => {
+    let data = '';
+    res.on('data', (c) => data += c);
+    res.on('end', () => {
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed.error) return reject(new Error(parsed.error.message));
+        const text = parsed.choices?.[0]?.message?.content || '';
+        resolve(text.trim());
+      } catch (e) { reject(e); }
+    });
+  });
+  req.on('error', reject);
+  req.setTimeout(60000, () => { req.destroy(); reject(new Error('Groq vision timeout')); });
+  req.write(body);
+  req.end();
+});
+
+// ── Groq Whisper API — for voice transcription ────────────────────────────────
+const groqWhisper = (audioBuffer, filename) => new Promise((resolve, reject) => {
+  const form = new FormData();
+  form.append('file', audioBuffer, { filename: filename || 'audio.mp3', contentType: 'audio/mpeg' });
+  form.append('model', 'whisper-large-v3');
+  form.append('response_format', 'text');
+
+  const options = {
+    hostname: 'api.groq.com',
+    path: '/openai/v1/audio/transcriptions',
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+      ...form.getHeaders()
+    }
+  };
+
+  const req = https.request(options, (res) => {
+    let data = '';
+    res.on('data', (c) => data += c);
+    res.on('end', () => {
+      try {
+        if (data && data.trim().length > 0 && !data.includes('"error"')) {
+          return resolve(data.trim());
+        }
+        const parsed = JSON.parse(data);
+        if (parsed.error) return reject(new Error(parsed.error.message));
+        resolve(parsed.text || '');
+      } catch (e) {
+        if (data && data.trim().length > 5) resolve(data.trim());
+        else reject(new Error('Empty transcription response'));
+      }
+    });
+  });
+  req.on('error', reject);
+  req.setTimeout(120000, () => { req.destroy(); reject(new Error('Whisper timeout')); });
+  form.pipe(req);
+});
+
+// ── Validate extracted text ───────────────────────────────────────────────────
 const validateText = (text, source) => {
-  if (!text || typeof text !== 'string') {
-    throw new Error(`No text returned from ${source}`);
-  }
+  if (!text || typeof text !== 'string') throw new Error(`No text returned from ${source}`);
   const trimmed = text.trim();
-  if (trimmed.length < 10) {
-    throw new Error(`Extracted text too short from ${source}`);
-  }
+  if (trimmed.length < 10) throw new Error(`Extracted text too short from ${source}`);
   return trimmed;
 };
 
-// ── Image → Text (Gemini Vision) ──────────────────────────────────────────────
+// ── Image → Text (Groq Vision) ────────────────────────────────────────────────
 const extractFromImage = async (imageUrl) => {
   console.log('extractFromImage called with:', imageUrl);
-  const model = getModel();
   const buffer = await fetchBuffer(imageUrl);
   console.log('Image buffer size:', buffer.length, 'bytes');
-
-  const base64Image = buffer.toString('base64');
-
   const ext = imageUrl.split('.').pop().toLowerCase().split('?')[0];
-  const mimeMap = {
-    jpg: 'image/jpeg', jpeg: 'image/jpeg',
-    png: 'image/png', gif: 'image/gif', webp: 'image/webp',
-  };
+  const mimeMap = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
   const mimeType = mimeMap[ext] || 'image/jpeg';
-  console.log('Image mimeType:', mimeType);
-
-  const result = await model.generateContent([
-    { inlineData: { mimeType, data: base64Image } },
-    'Extract and transcribe ALL text visible in this image. Return only the text content, preserving structure where possible.',
-  ]);
-
-  const text = result.response.text();
-  console.log('Gemini image extraction result length:', text?.length);
+  const base64Image = buffer.toString('base64');
+  const text = await groqVision(base64Image, mimeType,
+    'Extract and transcribe ALL text visible in this image. Return only the text content, preserving structure where possible. If there is no text, describe what you see.'
+  );
+  console.log('Groq vision result length:', text?.length);
   return validateText(text, 'image');
 };
 
-// ── PDF → Text (pdf-parse first, Gemini Vision fallback for scanned PDFs) ─────
+// ── PDF → Text (pdf-parse + Groq Vision fallback) ─────────────────────────────
 const extractFromPDF = async (pdfUrl) => {
   console.log('extractFromPDF called with:', pdfUrl);
   const buffer = await fetchBuffer(pdfUrl);
   console.log('PDF buffer size:', buffer.length, 'bytes');
 
-  // Try pdf-parse first (fast, works for text-based PDFs)
   try {
     const data = await pdfParse(buffer);
     const text = data.text?.trim();
     if (text && text.length > 50) {
-      console.log('pdf-parse succeeded, text length:', text.length);
+      console.log('pdf-parse succeeded, length:', text.length);
       return text;
     }
-    console.log('pdf-parse returned no text — trying Gemini Vision fallback');
-  } catch (parseErr) {
-    console.error('pdf-parse error:', parseErr.message, '— trying Gemini Vision fallback');
+    console.log('pdf-parse got no text — trying Groq Vision');
+  } catch (e) {
+    console.error('pdf-parse error:', e.message, '— trying Groq Vision');
   }
 
-  // Fallback: scanned PDF — send to Gemini Vision as base64
+  // Scanned PDF fallback — send as base64 image to Groq Vision
   const base64PDF = buffer.toString('base64');
-  const model = getModel();
-
-  const result = await model.generateContent([
-    { inlineData: { mimeType: 'application/pdf', data: base64PDF } },
-    'Extract and transcribe ALL text from this PDF document. Return only the text content.',
-  ]);
-
-  const text = result.response.text();
-  console.log('Gemini PDF extraction result length:', text?.length);
+  const text = await groqVision(base64PDF, 'image/jpeg',
+    'This is a scanned PDF page. Extract and transcribe ALL text you can see. Return only the text content.'
+  );
+  console.log('Groq vision PDF fallback length:', text?.length);
   return validateText(text, 'PDF');
 };
 
@@ -119,11 +169,11 @@ const extractFromPDF = async (pdfUrl) => {
 const extractFromYouTube = async (url) => {
   console.log('extractFromYouTube called with:', url);
   const match = url.match(/(?:v=|youtu\.be\/|embed\/)([^&?/\s]{11})/);
-  if (!match) throw new Error('Invalid YouTube URL — could not extract video ID');
+  if (!match) throw new Error('Invalid YouTube URL');
   const videoId = match[1];
   console.log('YouTube video ID:', videoId);
 
-  // Method 1: youtubei.js — mimics real browser, most reliable
+  // Method 1: youtubei.js
   try {
     const { Innertube } = await import('youtubei.js');
     const yt = await Innertube.create({ retrieve_player: false });
@@ -132,66 +182,37 @@ const extractFromYouTube = async (url) => {
     const segments = transcriptData?.transcript?.content?.body?.initial_segments;
     if (segments && segments.length > 0) {
       const text = segments.map((s) => s.snippet?.text || '').filter(Boolean).join(' ').trim();
-      if (text.length > 20) {
-        console.log('youtubei.js transcript length:', text.length);
-        return text;
-      }
+      if (text.length > 20) { console.log('youtubei.js success, length:', text.length); return text; }
     }
-  } catch (e) {
-    console.error('youtubei.js failed:', e.message);
-  }
+  } catch (e) { console.error('youtubei.js failed:', e.message); }
 
-  // Method 2: youtube-transcript (ESM — dynamic import required)
+  // Method 2: youtube-transcript
   try {
     const { YoutubeTranscript } = await import('youtube-transcript');
     const transcript = await YoutubeTranscript.fetchTranscript(videoId);
     if (transcript && transcript.length > 0) {
       const text = transcript.map((t) => t.text).join(' ').trim();
-      console.log('youtube-transcript length:', text.length);
+      console.log('youtube-transcript success, length:', text.length);
       return text;
     }
-  } catch (e) {
-    console.error('youtube-transcript failed:', e.message);
-  }
+  } catch (e) { console.error('youtube-transcript failed:', e.message); }
 
-  // Both failed — throw a clear error so the frontend shows a useful message
   throw new Error(
-    `Could not fetch transcript for YouTube video ${videoId}. ` +
-    `The video may not have captions enabled. ` +
-    `Open YouTube → click ··· under the video → "Show transcript" → copy and paste it manually.`
+    `Could not fetch transcript for video ${videoId}. ` +
+    `Open YouTube → click ··· → "Show transcript" → copy and paste manually.`
   );
 };
 
-// ── Voice → Text (Gemini multimodal audio) ───────────────────────────────────
+// ── Voice → Text (Groq Whisper) ───────────────────────────────────────────────
 const extractFromVoice = async (audioUrl) => {
   console.log('extractFromVoice called with:', audioUrl);
-  const model = getModel();
   const buffer = await fetchBuffer(audioUrl);
   console.log('Audio buffer size:', buffer.length, 'bytes');
-
-  const base64Audio = buffer.toString('base64');
   const ext = audioUrl.split('.').pop().toLowerCase().split('?')[0];
-  const mimeMap = {
-    mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4',
-    webm: 'audio/webm', ogg: 'audio/ogg', aac: 'audio/aac',
-  };
-  const mimeType = mimeMap[ext] || 'audio/mpeg';
-  console.log('Audio mimeType:', mimeType);
-
-  const result = await model.generateContent([
-    { inlineData: { mimeType, data: base64Audio } },
-    'Please transcribe this audio recording into text. Return only the spoken words, no timestamps or labels.',
-  ]);
-
-  const text = result.response.text();
-  console.log('Gemini voice transcription length:', text?.length);
+  const filename = `audio.${ext || 'mp3'}`;
+  const text = await groqWhisper(buffer, filename);
+  console.log('Whisper transcription length:', text?.length);
   return validateText(text, 'audio');
 };
 
-module.exports = {
-  extractFromImage,
-  extractFromPDF,
-  extractFromYouTube,
-  extractFromVoice,
-  fetchBuffer,
-};
+module.exports = { extractFromImage, extractFromPDF, extractFromYouTube, extractFromVoice, fetchBuffer };
