@@ -4,7 +4,7 @@ const Note         = require('../models/Note');
 const { protect }  = require('../middleware/auth');
 const { upload }   = require('../config/cloudinary');
 const { extractFromImage, extractFromPDF, extractFromYouTube, extractFromVoice } = require('../services/ingestionService');
-const { detectSubjectChapter } = require('../services/aiService');
+const { detectSubjectChapter, translateToEnglish } = require('../services/aiService');
 const { storeEmbedding, deleteEmbedding } = require('../services/vectorService');
 const { v4: uuidv4 } = require('uuid');
 
@@ -23,7 +23,7 @@ router.post('/upload', upload.single('file'), asyncHandler(async (req, res) => {
     extractedText = await extractFromYouTube(youtubeUrl);
     fileUrl = youtubeUrl;
   } else if (req.file) {
-    fileUrl = req.file.path; // Cloudinary secure URL
+    fileUrl = req.file.path;
     if (sourceType === 'pdf')   extractedText = await extractFromPDF(fileUrl);
     if (sourceType === 'image') extractedText = await extractFromImage(fileUrl);
     if (sourceType === 'voice') extractedText = await extractFromVoice(fileUrl);
@@ -31,17 +31,22 @@ router.post('/upload', upload.single('file'), asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Provide a file or YouTube URL' });
   }
 
-  if (!extractedText.trim()) return res.status(422).json({ message: 'Could not extract text from source' });
+  if (!extractedText || !extractedText.trim()) {
+    return res.status(422).json({ message: 'Could not extract text from source' });
+  }
 
-  const meta     = await detectSubjectChapter(extractedText);
+  // Auto-translate to English if content is in another language
+  console.log('Checking language and translating if needed...');
+  const englishText = await translateToEnglish(extractedText);
+
+  const meta     = await detectSubjectChapter(englishText);
   const noteId   = uuidv4();
   const autoTitle = title || `${meta.subject} — ${meta.chapter}`;
 
   const note = await Note.create({
-    _id: undefined,
     userId,
     title: autoTitle,
-    content: extractedText,
+    content: englishText,        // Save translated English content
     sourceType,
     fileUrl,
     subject:   meta.subject,
@@ -50,7 +55,7 @@ router.post('/upload', upload.single('file'), asyncHandler(async (req, res) => {
     pineconeId: noteId,
   });
 
-  await storeEmbedding(noteId, extractedText, {
+  await storeEmbedding(noteId, englishText, {
     userId,
     noteId:    note._id.toString(),
     subject:   meta.subject,
@@ -68,8 +73,8 @@ router.post('/upload', upload.single('file'), asyncHandler(async (req, res) => {
     keywords:  meta.keywords,
     sourceType,
     fileUrl,
-    preview:   extractedText.slice(0, 300),
-    wordCount: extractedText.split(/\s+/).length,
+    preview:   englishText.slice(0, 300),
+    wordCount: englishText.split(/\s+/).length,
   });
 }));
 
