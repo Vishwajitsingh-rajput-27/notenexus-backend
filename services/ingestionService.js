@@ -31,7 +31,7 @@ const fetchBuffer = (urlStr) =>
     } catch (e) { reject(e); }
   });
 
-// ── Groq Vision API — for image and scanned PDF ───────────────────────────────
+// ── Groq Vision API ───────────────────────────────────────────────────────────
 const groqVision = (base64Data, mimeType, prompt) => new Promise((resolve, reject) => {
   const body = JSON.stringify({
     model: 'meta-llama/llama-4-scout-17b-16e-instruct',
@@ -45,7 +45,6 @@ const groqVision = (base64Data, mimeType, prompt) => new Promise((resolve, rejec
     max_tokens: 4096,
     temperature: 0.1
   });
-
   const options = {
     hostname: 'api.groq.com',
     path: '/openai/v1/chat/completions',
@@ -56,7 +55,6 @@ const groqVision = (base64Data, mimeType, prompt) => new Promise((resolve, rejec
       'Content-Length': Buffer.byteLength(body)
     }
   };
-
   const req = https.request(options, (res) => {
     let data = '';
     res.on('data', (c) => data += c);
@@ -64,8 +62,7 @@ const groqVision = (base64Data, mimeType, prompt) => new Promise((resolve, rejec
       try {
         const parsed = JSON.parse(data);
         if (parsed.error) return reject(new Error(parsed.error.message));
-        const text = parsed.choices?.[0]?.message?.content || '';
-        resolve(text.trim());
+        resolve(parsed.choices?.[0]?.message?.content?.trim() || '');
       } catch (e) { reject(e); }
     });
   });
@@ -75,31 +72,24 @@ const groqVision = (base64Data, mimeType, prompt) => new Promise((resolve, rejec
   req.end();
 });
 
-// ── Groq Whisper API — for voice transcription ────────────────────────────────
+// ── Groq Whisper API ──────────────────────────────────────────────────────────
 const groqWhisper = (audioBuffer, filename) => new Promise((resolve, reject) => {
   const form = new FormData();
   form.append('file', audioBuffer, { filename: filename || 'audio.mp3', contentType: 'audio/mpeg' });
   form.append('model', 'whisper-large-v3');
   form.append('response_format', 'text');
-
   const options = {
     hostname: 'api.groq.com',
     path: '/openai/v1/audio/transcriptions',
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
-      ...form.getHeaders()
-    }
+    headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}`, ...form.getHeaders() }
   };
-
   const req = https.request(options, (res) => {
     let data = '';
     res.on('data', (c) => data += c);
     res.on('end', () => {
       try {
-        if (data && data.trim().length > 0 && !data.includes('"error"')) {
-          return resolve(data.trim());
-        }
+        if (data && data.trim().length > 0 && !data.includes('"error"')) return resolve(data.trim());
         const parsed = JSON.parse(data);
         if (parsed.error) return reject(new Error(parsed.error.message));
         resolve(parsed.text || '');
@@ -112,6 +102,36 @@ const groqWhisper = (audioBuffer, filename) => new Promise((resolve, reject) => 
   req.on('error', reject);
   req.setTimeout(120000, () => { req.destroy(); reject(new Error('Whisper timeout')); });
   form.pipe(req);
+});
+
+// ── Supadata YouTube Transcript API ──────────────────────────────────────────
+const supadataTranscript = (videoId) => new Promise((resolve, reject) => {
+  const options = {
+    hostname: 'api.supadata.ai',
+    path: `/v1/youtube/transcript?videoId=${videoId}&text=true`,
+    method: 'GET',
+    headers: {
+      'x-api-key': process.env.SUPADATA_API_KEY,
+      'Content-Type': 'application/json'
+    }
+  };
+  const req = https.request(options, (res) => {
+    let data = '';
+    res.on('data', (c) => data += c);
+    res.on('end', () => {
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed.error) return reject(new Error(parsed.error));
+        // Supadata returns { content: "full transcript text", ... }
+        const text = parsed.content || parsed.transcript || '';
+        if (text && text.length > 20) resolve(text.trim());
+        else reject(new Error('Empty transcript from Supadata'));
+      } catch (e) { reject(new Error('Supadata parse error: ' + e.message)); }
+    });
+  });
+  req.on('error', reject);
+  req.setTimeout(30000, () => { req.destroy(); reject(new Error('Supadata timeout')); });
+  req.end();
 });
 
 // ── Validate extracted text ───────────────────────────────────────────────────
@@ -138,17 +158,13 @@ const extractFromImage = async (imageUrl) => {
   return validateText(text, 'image');
 };
 
-// ── PDF → Text (pdf-parse + Groq Vision fallback) ─────────────────────────────
+// ── PDF → Text ────────────────────────────────────────────────────────────────
 const extractFromPDF = async (pdfUrl) => {
   console.log('extractFromPDF called with:', pdfUrl);
-
-  // Fix Cloudinary PDF URLs: /image/upload/ must be /raw/upload/ for PDFs
   const fixedUrl = pdfUrl.replace('/image/upload/', '/raw/upload/');
   if (fixedUrl !== pdfUrl) console.log('Fixed Cloudinary PDF URL to:', fixedUrl);
-
   const buffer = await fetchBuffer(fixedUrl);
   console.log('PDF buffer size:', buffer.length, 'bytes');
-
   try {
     const data = await pdfParse(buffer);
     const text = data.text?.trim();
@@ -158,9 +174,8 @@ const extractFromPDF = async (pdfUrl) => {
     }
     console.log('pdf-parse got no text — trying Groq Vision');
   } catch (e) {
-    console.error('pdf-parse error:', e.message, '— trying Groq Vision');
+    console.error('pdf-parse error:', e.message);
   }
-
   const base64PDF = buffer.toString('base64');
   const text = await groqVision(base64PDF, 'image/jpeg',
     'This is a scanned PDF page. Extract and transcribe ALL text you can see. Return only the text content.'
@@ -169,7 +184,7 @@ const extractFromPDF = async (pdfUrl) => {
   return validateText(text, 'PDF');
 };
 
-// ── YouTube → Manual Instructions (YouTube blocks cloud server IPs) ───────────
+// ── YouTube → Transcript (Supadata API — works from cloud servers) ─────────────
 const extractFromYouTube = async (url) => {
   console.log('extractFromYouTube called with:', url);
   const match = url.match(/(?:v=|youtu\.be\/|embed\/)([^&?/\s]{11})/);
@@ -177,20 +192,47 @@ const extractFromYouTube = async (url) => {
   const videoId = match[1];
   console.log('YouTube video ID:', videoId);
 
-  // YouTube blocks transcript fetching from cloud server IPs (Render, AWS etc.)
-  // Return helpful manual instructions as the note content instead
-  return `YouTube Video Note
-Video URL: ${url}
+  // Method 1: Supadata API — not blocked by YouTube, works from Render
+  try {
+    console.log('Trying Supadata API...');
+    const transcript = await supadataTranscript(videoId);
+    console.log('Supadata succeeded, length:', transcript.length);
+    return transcript;
+  } catch (e) {
+    console.error('Supadata failed:', e.message);
+  }
 
-To get the transcript for this video:
-1. Open the video on YouTube
-2. Click the three dots (...) below the video player
-3. Select "Show transcript"
-4. Click the three dots in the transcript panel → turn off "Toggle timestamps"
-5. Select all the transcript text, copy it
-6. Create a new note and paste the transcript there
+  // Method 2: youtubei.js
+  try {
+    console.log('Trying youtubei.js...');
+    const { Innertube } = await import('youtubei.js');
+    const yt = await Innertube.create({ retrieve_player: false });
+    const info = await yt.getInfo(videoId);
+    const transcriptData = await info.getTranscript();
+    const segments = transcriptData?.transcript?.content?.body?.initial_segments;
+    if (segments && segments.length > 0) {
+      const text = segments.map((s) => s.snippet?.text || '').filter(Boolean).join(' ').trim();
+      if (text.length > 20) { console.log('youtubei.js success, length:', text.length); return text; }
+    }
+  } catch (e) { console.error('youtubei.js failed:', e.message); }
 
-You can also summarise the key points from the video manually and save them as a note.`;
+  // Method 3: youtube-transcript
+  try {
+    console.log('Trying youtube-transcript...');
+    const { YoutubeTranscript } = await import('youtube-transcript');
+    const transcript = await YoutubeTranscript.fetchTranscript(videoId);
+    if (transcript && transcript.length > 0) {
+      const text = transcript.map((t) => t.text).join(' ').trim();
+      console.log('youtube-transcript success, length:', text.length);
+      return text;
+    }
+  } catch (e) { console.error('youtube-transcript failed:', e.message); }
+
+  // All failed
+  throw new Error(
+    `Could not fetch transcript for video ${videoId}. ` +
+    `Open YouTube → click ··· → "Show transcript" → copy and paste manually.`
+  );
 };
 
 // ── Voice → Text (Groq Whisper) ───────────────────────────────────────────────
