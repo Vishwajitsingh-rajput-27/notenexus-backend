@@ -13,6 +13,7 @@ const storage = new CloudinaryStorage({
   params: {
     folder: 'notenexus',
     resource_type: 'auto',
+    access_mode: 'public',
     allowed_formats: ['pdf', 'jpg', 'jpeg', 'png', 'webp', 'mp3', 'wav', 'm4a', 'webm'],
   },
 });
