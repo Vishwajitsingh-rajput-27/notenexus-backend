@@ -1,7 +1,7 @@
 const express      = require('express');
 const asyncHandler = require('express-async-handler');
 const Note         = require('../models/Note');
-const { protect }  = require('../middleware/auth');
+const protect = require('../middleware/auth');
 const { upload }   = require('../config/cloudinary');
 const { extractFromImage, extractFromPDF, extractFromYouTube, extractFromVoice } = require('../services/ingestionService');
 const { detectSubjectChapter, translateToEnglish } = require('../services/aiService');
