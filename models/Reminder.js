@@ -10,6 +10,7 @@ const reminderSchema = new mongoose.Schema({
   email:         { type: String, required: true },
   phone:         { type: String, default: '' },           // optional WhatsApp
   intervalDays:  { type: Number, default: 1 },
+  reminderTime:  { type: String, default: '09:00' },  // HH:MM, user's chosen time of day
   nextReminder:  { type: Date, default: Date.now },
   repetitions:   { type: Number, default: 0 },
   active:        { type: Boolean, default: true },
