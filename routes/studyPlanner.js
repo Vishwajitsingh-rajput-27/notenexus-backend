@@ -40,6 +40,7 @@ const groqCall = (prompt, maxTokens = 3000) => new Promise((resolve, reject) => 
 
 function buildPlannerPrompt({ subjects, examDate, dailyHours, weakTopics, studyStyle }) {
   const daysLeft = Math.max(1, Math.ceil((new Date(examDate) - new Date()) / 86400000));
+  const totalHours = daysLeft * dailyHours;
   return `Create a detailed study plan for a student preparing for exams.
 
 Student details:
@@ -56,20 +57,24 @@ Planning rules:
 4. Each session should be 45-90 min max
 5. Final 2 days: only light revision and past papers
 6. Session types: "study" | "revision" | "practice" | "rest"
+7. Session duration must be in MINUTES (e.g. 60, 90, 45)
 
 Return ONLY valid JSON, no markdown:
 {
-  "totalDays": ${daysLeft},
-  "examDate": "${examDate}",
-  "subjects": ${JSON.stringify(subjects)},
-  "plan": [
+  "summary": {
+    "totalDays": ${daysLeft},
+    "totalHours": ${totalHours},
+    "subjects": ${JSON.stringify(subjects)},
+    "strategy": "Brief 1-2 sentence description of the overall study strategy"
+  },
+  "dailyPlan": [
     {
       "day": 1,
       "date": "YYYY-MM-DD",
       "restDay": false,
-      "totalHours": 4,
+      "totalHours": ${dailyHours},
       "sessions": [
-        { "subject": "Physics", "topic": "Kinematics", "duration": 1.5, "type": "study", "notes": "Focus on equations of motion" }
+        { "subject": "Physics", "topic": "Kinematics", "duration": 90, "type": "study", "description": "Focus on equations of motion" }
       ]
     }
   ]
@@ -99,10 +104,23 @@ router.post('/generate', auth, async (req, res) => {
     if (new Date(examDate) <= new Date()) return res.status(400).json({ error: 'Exam date must be in the future' });
 
     const payload = { subjects, examDate, dailyHours, weakTopics, studyStyle };
-    const raw = await groqCall(buildPlannerPrompt(payload), 3000);
+    const raw = await groqCall(buildPlannerPrompt(payload), 4000);
     const plan = parsePlan(raw);
 
-    res.json({ success: true, usedModel: 'groq/llama-3.3-70b', ...plan });
+    // Ensure the response shape matches what the frontend expects
+    const response = {
+      success: true,
+      usedModel: 'groq/llama-3.3-70b',
+      summary: plan.summary || {
+        totalDays: plan.totalDays,
+        totalHours: (plan.totalDays || 1) * dailyHours,
+        subjects: plan.subjects || subjects,
+        strategy: '',
+      },
+      dailyPlan: plan.dailyPlan || plan.plan || [],
+    };
+
+    res.json(response);
   } catch (err) {
     console.error('Study planner error:', err.message);
     res.status(500).json({ error: err.message });
