@@ -92,6 +92,14 @@ router.get('/stats', protect, asyncHandler(async (req, res) => {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
   const recentCount = notes.filter(n => new Date(n.createdAt) > sevenDaysAgo).length;
 
+  const totalSubjects = Object.keys(bySubject).length;
+  const sharedNotes = notes.filter(n => n.isShared).length;
+  const subjectBreakdown = Object.entries(bySubject).map(([subject, count]) => ({ subject, count }));
+
+  // Account age in days
+  const createdAt = req.user.createdAt || new Date();
+  const accountAge = Math.floor((Date.now() - new Date(createdAt).getTime()) / (1000 * 60 * 60 * 24));
+
   // Full history with preview
   const history = notes.map(n => ({
     id:         n._id,
@@ -111,10 +119,14 @@ router.get('/stats', protect, asyncHandler(async (req, res) => {
     stats: {
       totalNotes,
       totalWords,
+      totalSubjects,
+      sharedNotes,
       byType,
       bySubject,
+      subjectBreakdown,
       recentCount,
-      memberSince: req.user.createdAt,
+      accountAge,
+      memberSince: createdAt,
     },
     history,
   });
