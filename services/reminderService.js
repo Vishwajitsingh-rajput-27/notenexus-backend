@@ -2,17 +2,28 @@ const cron = require('node-cron');
 const nodemailer = require('nodemailer');
 const Reminder = require('../models/Reminder');
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOGGING HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
 function log(...args) {
-  console.log(`[Reminder ${new Date().toISOString()}]`, ...args);
+  const timestamp = new Date().toISOString();
+  console.log(`[Reminder ${timestamp}]`, ...args);
 }
 
 function logError(...args) {
   console.error(`[Reminder ERROR]`, ...args);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONFIGURATION CHECKS
+// ═══════════════════════════════════════════════════════════════════════════════
+
 function checkEmailConfig() {
   const configured = !!(process.env.EMAIL_USER && process.env.EMAIL_PASS);
-  if (!configured) log('⚠️ EMAIL NOT CONFIGURED');
+  if (!configured) {
+    log('⚠️ EMAIL NOT CONFIGURED - EMAIL_USER or EMAIL_PASS missing');
+  }
   return configured;
 }
 
@@ -22,16 +33,23 @@ function checkTwilioConfig() {
     process.env.TWILIO_AUTH_TOKEN &&
     process.env.TWILIO_WHATSAPP_NUMBER
   );
-  if (!configured) log('⚠️ TWILIO NOT CONFIGURED');
+  if (!configured) {
+    log('⚠️ TWILIO NOT CONFIGURED - missing credentials');
+  }
   return configured;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EMAIL TRANSPORTER
+// ═══════════════════════════════════════════════════════════════════════════════
 
 let transporter = null;
 
 function getTransporter() {
   if (!checkEmailConfig()) return null;
+  
   if (!transporter) {
-    log('Creating email transporter for:', process.env.EMAIL_USER);
+    log('📧 Creating email transporter for:', process.env.EMAIL_USER);
     transporter = nodemailer.createTransport({
       service: 'gmail',
       auth: {
@@ -43,13 +61,20 @@ function getTransporter() {
   return transporter;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// TWILIO WHATSAPP
+// ═══════════════════════════════════════════════════════════════════════════════
+
 async function sendWhatsAppMessage(to, body) {
-  if (!checkTwilioConfig()) return false;
+  if (!checkTwilioConfig()) {
+    log('⚠️ Skipping WhatsApp - Twilio not configured');
+    return false;
+  }
 
   const toNum = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
   
   if (toNum === process.env.TWILIO_WHATSAPP_NUMBER) {
-    log('⚠️ Skipping WhatsApp - same To and From');
+    log('⚠️ Skipping WhatsApp - cannot send to same number');
     return false;
   }
 
@@ -65,13 +90,17 @@ async function sendWhatsAppMessage(to, body) {
       body: body.slice(0, 1600),
     });
     
-    log('✅ WhatsApp sent! SID:', message.sid);
+    log('✅ WhatsApp sent! Message SID:', message.sid);
     return true;
   } catch (err) {
-    logError('❌ WhatsApp failed:', err.message);
+    logError('❌ WhatsApp send failed:', err.message);
     return false;
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DATE HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
 
 function nextReminderDate(intervalDays, reminderTime = '09:00') {
   const [hours, minutes] = (reminderTime || '09:00').split(':').map(Number);
@@ -88,20 +117,25 @@ function formatTime(val) {
   return `${((h % 12) || 12).toString().padStart(2, '0')}:${m.toString().padStart(2, '0')} ${ampm}`;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// SEND EMAIL REMINDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
 async function sendEmailReminder(reminder) {
   const transport = getTransporter();
   if (!transport) {
-    log('⚠️ Email transporter not available');
+    log('⚠️ Email transporter not available - skipping email');
     return false;
   }
 
-  log('📧 Sending email to:', reminder.email);
+  log('📧 Sending email to:', reminder.email, 'for topic:', reminder.topic);
 
+  // Build schedule description
   let scheduleLabel, nextLabel;
   
   if (reminder.intervalMinutes) {
     scheduleLabel = `Every ${reminder.intervalMinutes} minute(s)`;
-    nextLabel = `Next in ${reminder.intervalMinutes} minute(s)`;
+    nextLabel = `Next reminder in ${reminder.intervalMinutes} minute(s)`;
   } else if (reminder.isOneShot) {
     scheduleLabel = 'One-time reminder';
     nextLabel = 'This was a one-time reminder.';
@@ -109,7 +143,7 @@ async function sendEmailReminder(reminder) {
     const days = reminder.intervalDays || 1;
     const time = formatTime(reminder.reminderTime);
     scheduleLabel = `Every ${days} day(s) at ${time}`;
-    nextLabel = `Next reminder in ${days} day(s)`;
+    nextLabel = `Next reminder in ${days} day(s) at ${time}`;
   }
 
   const html = `
@@ -137,19 +171,23 @@ async function sendEmailReminder(reminder) {
 
   try {
     const info = await transport.sendMail({
-      from: `"NoteNexus" <${process.env.EMAIL_USER}>`,
+      from: `"NoteNexus Reminders" <${process.env.EMAIL_USER}>`,
       to: reminder.email,
-      subject: `📚 Revision time: ${reminder.topic} (${reminder.subject})`,
+      subject: `📚 Revision Reminder: ${reminder.topic} (${reminder.subject})`,
       html,
     });
 
-    log('✅ Email sent! Message ID:', info.messageId);
+    log('✅ Email sent successfully! Message ID:', info.messageId);
     return true;
   } catch (err) {
-    logError('❌ Email failed:', err.message);
+    logError('❌ Email send failed:', err.message);
     return false;
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SEND WHATSAPP REMINDER
+// ═══════════════════════════════════════════════════════════════════════════════
 
 async function sendWhatsAppReminder(reminder) {
   if (!reminder.sendWhatsApp) {
@@ -158,12 +196,13 @@ async function sendWhatsAppReminder(reminder) {
   }
   
   if (!reminder.phone) {
-    log('⚠️ WhatsApp enabled but no phone number');
+    log('⚠️ WhatsApp enabled but no phone number provided');
     return false;
   }
 
   log('📱 Preparing WhatsApp reminder to:', reminder.phone);
 
+  // Build schedule description
   let scheduleLabel, nextLabel;
   
   if (reminder.intervalMinutes) {
@@ -194,48 +233,66 @@ async function sendWhatsAppReminder(reminder) {
   return await sendWhatsAppMessage(reminder.phone, msg);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// UNIFIED SEND FUNCTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
 async function sendReminder(reminder) {
   log('═══════════════════════════════════════════════════════');
   log('📤 SENDING REMINDER');
-  log('Topic:', reminder.topic);
-  log('Subject:', reminder.subject);
-  log('Email:', reminder.email);
-  log('Phone:', reminder.phone || 'NOT SET');
-  log('Send Email:', reminder.sendEmail !== false);
-  log('Send WhatsApp:', reminder.sendWhatsApp);
+  log('  Topic:', reminder.topic);
+  log('  Subject:', reminder.subject);
+  log('  Email:', reminder.email);
+  log('  Phone:', reminder.phone || 'NOT SET');
+  log('  Send Email:', reminder.sendEmail !== false);
+  log('  Send WhatsApp:', reminder.sendWhatsApp);
   log('═══════════════════════════════════════════════════════');
 
   const results = { email: false, whatsapp: false };
 
+  // Send email
   if (reminder.sendEmail !== false) {
     results.email = await sendEmailReminder(reminder);
   }
 
+  // Send WhatsApp
   if (reminder.sendWhatsApp && reminder.phone) {
     results.whatsapp = await sendWhatsAppReminder(reminder);
   }
 
-  log('📊 Results:', results);
+  log('📊 Send results:', JSON.stringify(results));
   return results;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// CRON JOB - RUNS EVERY MINUTE
+// ═══════════════════════════════════════════════════════════════════════════════
+
 function startReminderCron() {
   log('═══════════════════════════════════════════════════════');
-  log('📋 REMINDER SERVICE STARTING');
-  log('Email configured:', checkEmailConfig());
-  log('Twilio configured:', checkTwilioConfig());
+  log('📋 REMINDER SERVICE INITIALIZATION');
+  log('  Email configured:', checkEmailConfig());
+  log('  Twilio configured:', checkTwilioConfig());
+  log('  Email user:', process.env.EMAIL_USER || 'NOT SET');
+  log('  Twilio number:', process.env.TWILIO_WHATSAPP_NUMBER || 'NOT SET');
   log('═══════════════════════════════════════════════════════');
 
+  // Schedule cron to run every minute
   cron.schedule('* * * * *', async () => {
     try {
       const now = new Date();
       
+      // Find reminders that are due
       const due = await Reminder.find({
         active: true,
         nextReminder: { $lte: now },
       });
 
-      if (due.length === 0) return;
+      if (due.length === 0) {
+        // Uncomment this line if you want to see every cron tick
+        // log('⏰ Cron tick - no reminders due');
+        return;
+      }
 
       log('═══════════════════════════════════════════════════════');
       log(`⏰ CRON TICK: ${now.toISOString()}`);
@@ -243,45 +300,57 @@ function startReminderCron() {
       log('═══════════════════════════════════════════════════════');
 
       for (const reminder of due) {
-        log(`\n🔔 Processing: "${reminder.topic}" (ID: ${reminder._id})`);
+        log(`\n🔔 Processing reminder: "${reminder.topic}" (ID: ${reminder._id})`);
 
         try {
+          // Send the reminder
           await sendReminder(reminder);
 
+          // Update reminder state
           reminder.lastSentAt = now;
           reminder.repetitions = (reminder.repetitions || 0) + 1;
 
           if (reminder.isOneShot) {
+            // One-shot reminder - deactivate after sending
             reminder.active = false;
-            log('✅ One-shot completed, deactivated');
+            log('✅ One-shot reminder completed and deactivated');
           } else {
+            // Repeating reminder - schedule next occurrence
             if (reminder.intervalMinutes) {
+              // Minute-based interval
               reminder.nextReminder = new Date(now.getTime() + reminder.intervalMinutes * 60 * 1000);
-              log(`⏭️ Next in ${reminder.intervalMinutes} min`);
+              log(`⏭️  Next reminder in ${reminder.intervalMinutes} minute(s) at ${reminder.nextReminder.toISOString()}`);
             } else {
+              // Day-based interval
               const days = reminder.intervalDays || 1;
               reminder.nextReminder = nextReminderDate(days, reminder.reminderTime);
-              log(`⏭️ Next in ${days} day(s)`);
+              log(`⏭️  Next reminder in ${days} day(s) at ${reminder.nextReminder.toISOString()}`);
             }
           }
 
           await reminder.save();
-          log('✅ Reminder state saved');
+          log('✅ Reminder state updated and saved');
 
         } catch (err) {
-          logError(`Failed to process reminder ${reminder._id}:`, err.message);
+          logError(`❌ Failed to process reminder ${reminder._id}:`, err.message);
+          logError(err.stack);
         }
       }
 
-      log('\n✅ Cron cycle complete\n');
+      log('\n✅ Cron cycle completed successfully\n');
 
     } catch (err) {
-      logError('Cron error:', err.message);
+      logError('❌ Cron execution error:', err.message);
+      logError(err.stack);
     }
   });
 
-  console.log('✅ Revision reminder cron started (runs every minute)');
+  console.log('✅ Revision reminder cron job started (runs every minute)');
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXPORTS
+// ═══════════════════════════════════════════════════════════════════════════════
 
 module.exports = {
   startReminderCron,
