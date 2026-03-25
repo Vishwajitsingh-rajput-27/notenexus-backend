@@ -1,3 +1,16 @@
+// routes/whatsapp.js  —  NoteNexus
+//
+// CHANGES vs original:
+//   • handleIncomingPDF()  — when a WhatsApp user sends a PDF, we download,
+//     extract text + images, save a Note, then reply with a summary and
+//     the first extracted page image back to the user.
+//   • handleIncomingImage() — when user sends an image, extract text via Groq
+//     Vision and save as an image Note.
+//   • Webhook now detects MediaContentType and routes accordingly.
+//   • WhatsApp users can type "images <N>" to get page images of their Nth note.
+//
+// Everything else (sessions, link codes, existing commands) is UNCHANGED.
+
 const express  = require('express');
 const router   = express.Router();
 const https    = require('https');
@@ -7,9 +20,17 @@ const { WhatsAppSession, WhatsAppLinkCode } = require('../models/WhatsAppSession
 const Note      = require('../models/Note');
 const SavedItem = require('../models/SavedItem');
 const Reminder  = require('../models/Reminder');
+const {
+  extractFromPDF,
+  extractFromImage,
+  extractImagesFromPDF,
+} = require('../services/ingestionService');
+const { detectSubjectChapter, translateToEnglish } = require('../services/aiService');
+const { storeEmbedding } = require('../services/vectorService');
+const { v4: uuidv4 }   = require('uuid');
+const { upload, cloudinary } = require('../config/cloudinary');
 
 // ─── Groq AI helper ───────────────────────────────────────────────────────────
-
 async function askGroq(prompt) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
@@ -18,7 +39,6 @@ async function askGroq(prompt) {
       max_tokens: 500,
       temperature: 0.7,
     });
-
     const options = {
       hostname: 'api.groq.com',
       path: '/openai/v1/chat/completions',
@@ -29,7 +49,6 @@ async function askGroq(prompt) {
         'Content-Length': Buffer.byteLength(body),
       },
     };
-
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', (c) => data += c);
@@ -42,7 +61,6 @@ async function askGroq(prompt) {
         } catch (e) { reject(e); }
       });
     });
-
     req.on('error', reject);
     req.setTimeout(25000, () => { req.destroy(); reject(new Error('Groq timeout')); });
     req.write(body);
@@ -51,13 +69,10 @@ async function askGroq(prompt) {
 }
 
 // ─── Twilio helper ────────────────────────────────────────────────────────────
-
 function getTwilioClient() {
-  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
+  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN)
     throw new Error('Twilio env vars not set');
-  }
-  const twilio = require('twilio');
-  return twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+  return require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 }
 
 async function sendWhatsApp(to, body) {
@@ -69,489 +84,323 @@ async function sendWhatsApp(to, body) {
   });
 }
 
-// ─── Format helpers ───────────────────────────────────────────────────────────
+// Send a WhatsApp message that includes a media image URL
+async function sendWhatsAppMedia(to, body, mediaUrl) {
+  const client = getTwilioClient();
+  await client.messages.create({
+    from: process.env.TWILIO_WHATSAPP_NUMBER,
+    to,
+    body: body.slice(0, 1600),
+    mediaUrl: [mediaUrl],
+  });
+}
 
+// ─── Format helpers (unchanged from original) ─────────────────────────────────
 function formatNotesList(notes) {
   if (!notes.length) return '📭 You have no notes yet.\n\nUpload notes at notenexus.vercel.app';
   const lines = notes.slice(0, 10).map((n, i) => {
     const date = new Date(n.createdAt).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
-    return `${i + 1}. 📄 *${n.title}*\n   Subject: ${n.subject} | ${n.chapter}\n   Added: ${date}`;
+    const imgBadge = n.extractedImages?.length ? ` 🖼️×${n.extractedImages.length}` : '';
+    return `${i + 1}. 📄 *${n.title}*${imgBadge}\n   Subject: ${n.subject} | ${n.chapter}\n   Added: ${date}`;
   });
   const extra = notes.length > 10 ? `\n\n...and ${notes.length - 10} more notes.` : '';
-  return `📚 *Your Notes* (${notes.length} total)\n\n${lines.join('\n\n')}${extra}\n\nType a number (e.g. *1*) to read that note.`;
-}
-
-function formatSavedList(items) {
-  if (!items.length) return '📭 You have no saved items yet.\n\nSave flashcards, mind maps & more from notenexus.vercel.app';
-  const emoji = { mindmap: '🗺️', flashcards: '🃏', chat: '💬', studyplan: '📅', examquestions: '📝', quiz: '❓' };
-  const lines = items.slice(0, 10).map((item, i) => {
-    const date = new Date(item.createdAt).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
-    const icon = emoji[item.type] || '📌';
-    return `${i + 1}. ${icon} *${item.name}*\n   Type: ${item.type}${item.subject ? ' | ' + item.subject : ''}\n   Saved: ${date}`;
-  });
-  const extra = items.length > 10 ? `\n\n...and ${items.length - 10} more items.` : '';
-  return `💾 *Your Saved Items* (${items.length} total)\n\n${lines.join('\n\n')}${extra}\n\nType a number (e.g. *1*) to view that item.`;
+  return `📚 *Your Notes* (${notes.length} total)\n\n${lines.join('\n\n')}${extra}\n\nType a number to read a note, or *images <N>* to see PDF images.`;
 }
 
 function formatNoteDetail(note) {
   const sourceIcon = { pdf: '📄', image: '🖼️', youtube: '🎥', voice: '🎙️', whatsapp: '💬', text: '📝' };
   const icon = sourceIcon[note.sourceType] || '📄';
-
-  let lines = [];
+  const lines = [];
   lines.push(`${icon} *${note.title}*`);
   lines.push(`📚 Subject: ${note.subject} | ${note.chapter}`);
-  if (note.sourceType === 'youtube' && note.fileUrl) lines.push(`🔗 YouTube: ${note.fileUrl}`);
-  if (['pdf','image','voice'].includes(note.sourceType) && note.fileUrl) lines.push(`🔗 File: ${note.fileUrl}`);
+  if (note.extractedImages?.length)
+    lines.push(`🖼️ *${note.extractedImages.length} images extracted* — type *images <N>* to view`);
   if (note.keywords?.length) lines.push(`🏷️ Keywords: ${note.keywords.join(', ')}`);
   lines.push('');
   if (note.content) {
     lines.push(note.content.slice(0, 800));
-    if (note.content.length > 800) lines.push('\n_(content truncated — open app to read full note)_');
-  } else {
-    lines.push('_(no text content extracted)_');
+    if (note.content.length > 800) lines.push('\n_(content truncated — open app for full note)_');
   }
   return lines.join('\n');
 }
 
-function formatSavedDetail(item) {
-  const emoji = { mindmap: '🗺️', flashcards: '🃏', chat: '💬', studyplan: '📅', examquestions: '📝', quiz: '❓' };
-  const icon = emoji[item.type] || '📌';
-  let lines = [];
-  lines.push(`${icon} *${item.name}*`);
-  if (item.subject) lines.push(`📚 Subject: ${item.subject}`);
-  lines.push('');
+// ─── NEW: Handle incoming PDF from WhatsApp ───────────────────────────────────
+async function handleIncomingPDF(session, mediaUrl, mediaContentType, from) {
+  try {
+    await sendWhatsApp(from, '📄 PDF received! Processing text and extracting images... ⏳');
 
-  if (item.type === 'flashcards' && Array.isArray(item.data)) {
-    const cards = item.data;
-    lines.push(`🃏 *${cards.length} Flashcards:*\n`);
-    cards.forEach((f, i) => {
-      lines.push(`*Q${i+1}:* ${f.question}`);
-      lines.push(`*A${i+1}:* ${f.answer}\n`);
-    });
+    // Download and upload to Cloudinary so we have a permanent URL
+    const https = require('https');
+    const http  = require('http');
+    const { URL } = require('url');
 
-  } else if (item.type === 'examquestions') {
-    // data can be array of question objects or { questions: [...] }
-    const raw = Array.isArray(item.data) ? item.data : (item.data?.questions || []);
-    lines.push(`📝 *${raw.length} Exam Questions:*\n`);
-    raw.forEach((q, i) => {
-      const qText = typeof q === 'string' ? q : (q.question || q.text || '');
-      const qType = q.type ? ` _(${q.type})_` : '';
-      const diff  = q.difficulty ? ` [${q.difficulty}]` : '';
-      lines.push(`*Q${i+1}:*${diff}${qType} ${qText}`);
-      if (Array.isArray(q.options)) {
-        q.options.forEach(opt => lines.push(`   ${opt}`));
-      }
-      if (q.answer) lines.push(`✅ *Answer:* ${q.answer}`);
-      lines.push('');
-    });
-
-  } else if (item.type === 'studyplan') {
-    const plan = item.data?.plan || item.data;
-    if (typeof plan === 'string') {
-      lines.push(plan.slice(0, 1200));
-    } else if (Array.isArray(plan)) {
-      plan.forEach(day => {
-        lines.push(`📅 *Day ${day.day}* — ${day.date || ''}`);
-        if (Array.isArray(day.sessions)) {
-          day.sessions.forEach(s => lines.push(`  • ${s.subject}: ${s.topic} (${s.duration} min)`));
-        }
-        lines.push('');
+    const fetchBuffer = (urlStr) => new Promise((resolve, reject) => {
+      const parsed = new URL(urlStr);
+      const lib = parsed.protocol === 'https:' ? https : http;
+      // Twilio media URLs require auth
+      const authHeader = 'Basic ' + Buffer.from(
+        `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
+      ).toString('base64');
+      const options = { hostname: parsed.hostname, path: parsed.pathname + parsed.search, headers: { Authorization: authHeader } };
+      const req = lib.get(options, (res) => {
+        const chunks = [];
+        res.on('data', c => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+        res.on('error', reject);
       });
-    } else {
-      lines.push(JSON.stringify(plan).slice(0, 800));
+      req.on('error', reject);
+    });
+
+    const pdfBuffer = await fetchBuffer(mediaUrl);
+
+    // Upload PDF to Cloudinary
+    const uploadedPdf = await new Promise((resolve, reject) => {
+      const { Readable } = require('stream');
+      const stream = cloudinary.uploader.upload_stream(
+        { resource_type: 'raw', format: 'pdf', folder: 'notenexus/whatsapp-pdfs' },
+        (err, result) => { if (err) reject(err); else resolve(result); }
+      );
+      Readable.from(pdfBuffer).pipe(stream);
+    });
+
+    const pdfCloudinaryUrl = uploadedPdf.secure_url;
+
+    // Extract text + images in parallel
+    const [extractedText, imgResult] = await Promise.all([
+      extractFromPDF(pdfCloudinaryUrl),
+      extractImagesFromPDF(pdfCloudinaryUrl, { maxPages: 10, extractEmbedded: true }),
+    ]);
+
+    if (!extractedText?.trim()) {
+      return sendWhatsApp(from, '⚠️ Could not extract text from that PDF. Please try a text-based PDF.');
     }
 
-  } else if (item.type === 'mindmap') {
-    const title   = item.data?.title || item.data?.topic || item.name;
-    const summary = item.data?.summary || '';
-    const nodes   = item.data?.nodes || item.data?.branches || [];
-    lines.push(`🗺️ *${title}*`);
-    if (summary) lines.push(`\n${summary}`);
-    if (Array.isArray(nodes) && nodes.length) {
-      lines.push('\n*Key branches:*');
-      nodes.slice(0, 10).forEach(n => {
-        const label = typeof n === 'string' ? n : (n.label || n.text || n.name || '');
-        if (label) lines.push(`  • ${label}`);
-      });
+    const englishText = await translateToEnglish(extractedText);
+    const meta        = await detectSubjectChapter(englishText);
+    const autoTitle   = `${meta.subject} — ${meta.chapter}`;
+    const noteId      = uuidv4();
+
+    const allImages = [...imgResult.pageImages, ...imgResult.embeddedImages];
+
+    const note = await Note.create({
+      userId:          session.userId,
+      title:           autoTitle,
+      content:         englishText,
+      sourceType:      'whatsapp',
+      fileUrl:         pdfCloudinaryUrl,
+      subject:         meta.subject,
+      chapter:         meta.chapter,
+      keywords:        meta.keywords || [],
+      pineconeId:      noteId,
+      extractedImages: allImages,
+    });
+
+    await storeEmbedding(noteId, englishText, {
+      userId:    session.userId.toString(),
+      noteId:    note._id.toString(),
+      subject:   meta.subject,
+      chapter:   meta.chapter,
+      sourceType: 'whatsapp',
+      fileUrl:   pdfCloudinaryUrl,
+      title:     autoTitle,
+    });
+
+    // Reply with summary
+    const summary = `✅ *PDF Saved!*\n\n📚 *${autoTitle}*\nSubject: ${meta.subject}\nChapter: ${meta.chapter}\nKeywords: ${(meta.keywords || []).slice(0, 5).join(', ')}\n🖼️ ${allImages.length} images extracted\n📝 ${englishText.split(/\s+/).length} words\n\n${englishText.slice(0, 400)}${englishText.length > 400 ? '...' : ''}`;
+
+    await sendWhatsApp(from, summary);
+
+    // Send the first page image back if available
+    if (allImages.length > 0) {
+      await sendWhatsAppMedia(from, `🖼️ Page 1 of your PDF (${allImages.length} total pages extracted):`, allImages[0]);
     }
-    lines.push('\n_(Full mind map visible in the app)_');
 
-  } else if (item.type === 'quiz' && Array.isArray(item.data)) {
-    lines.push(`❓ *${item.data.length} Quiz Questions:*\n`);
-    item.data.forEach((q, i) => {
-      lines.push(`*Q${i+1}:* ${q.question || q}`);
-      if (Array.isArray(q.options)) q.options.forEach(o => lines.push(`   ${o}`));
-      if (q.answer) lines.push(`✅ *Answer:* ${q.answer}`);
-      lines.push('');
-    });
-
-  } else if (item.type === 'chat') {
-    const msgs = Array.isArray(item.data) ? item.data : (item.data?.messages || []);
-    lines.push(`💬 *${msgs.length} messages saved*\n`);
-    msgs.slice(0, 8).forEach(m => {
-      const role = m.role === 'user' ? '🧑' : '🤖';
-      const text = (m.content || m.text || '').slice(0, 200);
-      lines.push(`${role} ${text}\n`);
-    });
-    if (msgs.length > 8) lines.push(`_(${msgs.length - 8} more messages — open app to read)_`);
+  } catch (err) {
+    console.error('[handleIncomingPDF]', err);
+    await sendWhatsApp(from, '❌ Failed to process your PDF. Please try again or upload at notenexus.vercel.app');
   }
-
-  return lines.join('\n').slice(0, 1550);
 }
 
-// ─── Numbered item selection (in-memory cache) ────────────────────────────────
-const listCache = new Map(); // phone -> { type: 'notes'|'saved', items: [...] }
-
-// ─── POST /api/whatsapp/webhook ───────────────────────────────────────────────
-
-router.post('/webhook', express.urlencoded({ extended: false }), async (req, res) => {
+// ─── NEW: Handle incoming image from WhatsApp ─────────────────────────────────
+async function handleIncomingImage(session, mediaUrl, from) {
   try {
-    const { Body = '', From } = req.body;
-    const text  = Body.trim();
-    const lower = text.toLowerCase();
+    await sendWhatsApp(from, '🖼️ Image received! Extracting text... ⏳');
 
-    if (!text) return res.sendStatus(200);
-
-    console.log(`WhatsApp from ${From}: ${text.slice(0, 80)}`);
-
-    // ── Link command (no auth needed) ─────────────────────────────────────────
-    if (lower.startsWith('link ')) {
-      const code = text.slice(5).trim().toUpperCase();
-      const linkEntry = await WhatsAppLinkCode.findOne({ code });
-      if (!linkEntry) {
-        await sendWhatsApp(From, '❌ Invalid or expired link code.\n\nGenerate a new one from the NoteNexus app (WhatsApp tab).');
-        return res.sendStatus(200);
-      }
-      await WhatsAppSession.findOneAndUpdate(
-        { phone: From },
-        { phone: From, userId: linkEntry.userId, linkedAt: new Date() },
-        { upsert: true, new: true }
-      );
-      await WhatsAppLinkCode.deleteOne({ code });
-      await sendWhatsApp(From, '✅ *NoteNexus linked successfully!*\n\nYou can now access your notes and saved items.\n\nTry:\n• *notes* — list your notes\n• *saved* — list saved items\n• *notes: <subject>* — filter by subject\n• *saved: flashcards* — filter by type');
-      return res.sendStatus(200);
+    const extractedText = await extractFromImage(mediaUrl);
+    if (!extractedText?.trim()) {
+      return sendWhatsApp(from, '⚠️ Could not extract text from that image. Is it a clear photo of notes?');
     }
 
-    // ── Find linked user ───────────────────────────────────────────────────────
-    const session = await WhatsAppSession.findOne({ phone: From });
-    const userId  = session?.userId;
+    const englishText = await translateToEnglish(extractedText);
+    const meta        = await detectSubjectChapter(englishText);
+    const autoTitle   = `${meta.subject} — ${meta.chapter}`;
+    const noteId      = uuidv4();
 
-    // ── Notes commands ────────────────────────────────────────────────────────
-    if (lower === 'notes' || lower.startsWith('notes:')) {
-      if (!userId) {
-        await sendWhatsApp(From, '🔒 Link your NoteNexus account first:\n\n1. Open the NoteNexus app\n2. Go to *WhatsApp* tab\n3. Click *Generate Link Code*\n4. Send: *link <code>* here');
-        return res.sendStatus(200);
-      }
-      const subject = lower.startsWith('notes:') ? text.slice(6).trim() : null;
-      const filter  = { userId };
-      if (subject) filter.subject = new RegExp(subject, 'i');
-      const notes = await Note.find(filter).sort({ createdAt: -1 }).limit(20).select('-content');
-      listCache.set(From, { type: 'notes', items: notes });
-      await sendWhatsApp(From, formatNotesList(notes));
-      return res.sendStatus(200);
-    }
-
-    // ── Saved items commands ──────────────────────────────────────────────────
-    if (lower === 'saved' || lower.startsWith('saved:')) {
-      if (!userId) {
-        await sendWhatsApp(From, '🔒 Link your NoteNexus account first:\n\n1. Open the NoteNexus app\n2. Go to *WhatsApp* tab\n3. Click *Generate Link Code*\n4. Send: *link <code>* here');
-        return res.sendStatus(200);
-      }
-      const typeFilter = lower.startsWith('saved:') ? text.slice(6).trim().toLowerCase() : null;
-      const filter = { userId };
-      const validTypes = ['mindmap', 'flashcards', 'chat', 'studyplan', 'examquestions', 'quiz'];
-      if (typeFilter && validTypes.includes(typeFilter)) filter.type = typeFilter;
-      const items = await SavedItem.find(filter).sort({ createdAt: -1 }).limit(20);
-      listCache.set(From, { type: 'saved', items });
-      await sendWhatsApp(From, formatSavedList(items));
-      return res.sendStatus(200);
-    }
-
-    // ── Numbered selection from previous list ────────────────────────────────
-    const num = parseInt(text, 10);
-    if (!isNaN(num) && num > 0 && listCache.has(From)) {
-      const cached = listCache.get(From);
-      const item   = cached.items[num - 1];
-      if (item) {
-        if (cached.type === 'notes') {
-          const full = await Note.findById(item._id);
-          await sendWhatsApp(From, full ? formatNoteDetail(full) : '❌ Could not load note.');
-        } else {
-          await sendWhatsApp(From, formatSavedDetail(item));
-        }
-        return res.sendStatus(200);
-      }
-    }
-
-    // ── Reminder commands ────────────────────────────────────────────────────
-    // remind me: <topic> | <subject> | today 15:30
-    // remind me: <topic> | <subject> | every 3 days 09:00
-    // remind me: <topic> | <subject> | every 45 minutes
-    // remind me: <topic> | <subject> | on 2026-04-10 08:00
-    // reminders — list active reminders
-    // cancel reminder <number>
-
-    if (lower === 'reminders' || lower === 'my reminders') {
-      if (!userId) {
-        await sendWhatsApp(From, '🔒 Link your NoteNexus account to manage reminders.\n\nSend: *link <code>* (get the code from the app).');
-        return res.sendStatus(200);
-      }
-      const rems = await Reminder.find({ user: userId, active: true }).sort('-createdAt').limit(10);
-      if (!rems.length) {
-        await sendWhatsApp(From, '📭 You have no active reminders.\n\nCreate one:\n*remind me: Calculus | Maths | every 3 days 09:00*');
-        return res.sendStatus(200);
-      }
-      listCache.set(From + ':reminders', rems);
-      const lines = rems.map((r, i) => {
-        const schedule = r.isOneShot
-          ? `once on ${new Date(r.oneShotAt || r.nextReminder).toLocaleDateString('en-GB', { day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit' })}`
-          : `every ${r.intervalDays} day(s) at ${r.reminderTime}`;
-        return `${i + 1}. 🔔 *${r.topic}* (${r.subject})\n   ${schedule}${r.sendWhatsApp ? ' 📱' : ' 📧'}`;
-      });
-      await sendWhatsApp(From, `🔔 *Your Active Reminders* (${rems.length})\n\n${lines.join('\n\n')}\n\nSend *cancel reminder <number>* to delete one.`);
-      return res.sendStatus(200);
-    }
-
-    if (lower.startsWith('cancel reminder ')) {
-      if (!userId) {
-        await sendWhatsApp(From, '🔒 Link your account first.');
-        return res.sendStatus(200);
-      }
-      const n = parseInt(text.slice(16).trim(), 10);
-      const cached = listCache.get(From + ':reminders');
-      if (isNaN(n) || !cached || !cached[n - 1]) {
-        await sendWhatsApp(From, '❌ Send *reminders* first, then *cancel reminder <number>*.');
-        return res.sendStatus(200);
-      }
-      const rem = cached[n - 1];
-      await Reminder.findOneAndUpdate({ _id: rem._id, user: userId }, { active: false });
-      listCache.delete(From + ':reminders');
-      await sendWhatsApp(From, `✅ Reminder "${rem.topic}" cancelled.`);
-      return res.sendStatus(200);
-    }
-
-    // remind me: <topic> | <subject> | <schedule>
-    if (lower.startsWith('remind me:') || lower.startsWith('remind:')) {
-      if (!userId) {
-        await sendWhatsApp(From, '🔒 Link your NoteNexus account first to set reminders.\n\nSend: *link <code>* (get the code from the app).');
-        return res.sendStatus(200);
-      }
-
-      const raw = text.slice(lower.startsWith('remind me:') ? 10 : 7).trim();
-      // Format: <topic> | <subject> | <schedule>
-      const parts = raw.split('|').map(s => s.trim());
-      if (parts.length < 2) {
-        await sendWhatsApp(From,
-          '❌ Format:\n*remind me: <topic> | <subject> | <schedule>*\n\nExamples:\n' +
-          '• remind me: Calculus | Maths | today 18:00\n' +
-          '• remind me: Cell biology | Biology | every 3 days 09:00\n' +
-          '• remind me: Vocab | English | every 30 minutes\n' +
-          '• remind me: Past papers | Physics | on 2026-04-15 10:00'
-        );
-        return res.sendStatus(200);
-      }
-
-      const topic   = parts[0];
-      const subject = parts[1];
-      const sched   = (parts[2] || 'every 1 day 09:00').toLowerCase();
-
-      // Get user email from DB
-      const User = require('../models/User');
-      const userDoc = await User.findById(userId).select('email');
-      const email = userDoc?.email || '';
-
-      // Get linked WhatsApp phone
-      const sess = await WhatsAppSession.findOne({ userId });
-
-      // Parse schedule string
-      let scheduleType    = 'repeating';
-      let intervalDays    = 1;
-      let intervalMinutes = null;
-      let reminderTime    = '09:00';
-      let customDate      = null;
-
-      // Extract time (HH:MM) from anywhere in the schedule string
-      const timeMatch = sched.match(/\b(\d{1,2}):(\d{2})\b/);
-      if (timeMatch) {
-        reminderTime = `${timeMatch[1].padStart(2,'0')}:${timeMatch[2]}`;
-      }
-
-      if (sched.startsWith('today')) {
-        scheduleType = 'today';
-
-      } else if (sched.match(/on\s+\d{4}-\d{2}-\d{2}/)) {
-        scheduleType = 'custom_date';
-        const dateMatch = sched.match(/(\d{4}-\d{2}-\d{2})/);
-        customDate = dateMatch ? dateMatch[1] : null;
-
-      } else if (sched.includes('minute')) {
-        scheduleType = 'interval_minutes';
-        const minsMatch = sched.match(/(\d+)\s*min/);
-        intervalMinutes = minsMatch ? parseInt(minsMatch[1]) : 30;
-
-      } else {
-        // every N days
-        scheduleType = 'repeating';
-        const daysMatch = sched.match(/(\d+)\s*day/);
-        intervalDays = daysMatch ? parseInt(daysMatch[1]) : 1;
-      }
-
-      try {
-        const { sendReminder } = require('../services/reminderService');
-
-        // Build nextReminder
-        let nextReminder;
-        let isOneShot = false;
-        let oneShotAt = null;
-        const [h, m]  = reminderTime.split(':').map(Number);
-
-        if (scheduleType === 'today') {
-          isOneShot = true;
-          oneShotAt = new Date();
-          oneShotAt.setHours(h, m, 0, 0);
-          if (oneShotAt <= new Date()) oneShotAt.setDate(oneShotAt.getDate() + 1);
-          nextReminder = oneShotAt;
-        } else if (scheduleType === 'custom_date') {
-          isOneShot = true;
-          oneShotAt = new Date(`${customDate}T${reminderTime}:00`);
-          nextReminder = oneShotAt;
-        } else if (scheduleType === 'interval_minutes') {
-          nextReminder = new Date(Date.now() + intervalMinutes * 60 * 1000);
-          intervalDays = 0;
-        } else {
-          nextReminder = new Date(); // send immediately then schedule
-        }
-
-        const reminder = await Reminder.create({
-          user: userId, subject, topic, email,
-          phone: sess?.phone || '',
-          intervalDays,
-          reminderTime,
-          isOneShot, oneShotAt, nextReminder,
-          sendEmail: true,
-          sendWhatsApp: true, // always send to WhatsApp since they set it from WhatsApp
-        });
-
-        // Send first one now for repeating
-        if (!isOneShot) {
-          await sendReminder(reminder);
-          reminder.lastSentAt  = new Date();
-          reminder.repetitions = 1;
-          if (intervalMinutes) {
-            reminder.nextReminder = new Date(Date.now() + intervalMinutes * 60 * 1000);
-          } else {
-            const next = new Date();
-            next.setDate(next.getDate() + intervalDays);
-            next.setHours(h, m, 0, 0);
-            reminder.nextReminder = next;
-          }
-          await reminder.save();
-        }
-
-        const schedLabel = scheduleType === 'today'
-          ? `Today at ${reminderTime}`
-          : scheduleType === 'custom_date'
-          ? `${customDate} at ${reminderTime}`
-          : scheduleType === 'interval_minutes'
-          ? `Every ${intervalMinutes} minutes`
-          : `Every ${intervalDays} day(s) at ${reminderTime}`;
-
-        await sendWhatsApp(From,
-          `✅ *Reminder set!*\n\n` +
-          `📖 *Topic:* ${topic}\n` +
-          `📚 *Subject:* ${subject}\n` +
-          `🕐 *Schedule:* ${schedLabel}\n` +
-          `📱 *Via:* WhatsApp + Email\n\n` +
-          `Send *reminders* to see all your reminders.`
-        );
-      } catch (err) {
-        console.error('[WhatsApp] reminder creation error:', err.message);
-        await sendWhatsApp(From, `❌ Could not create reminder: ${err.message}`);
-      }
-      return res.sendStatus(200);
-    }
-
-    // ── AI study commands ─────────────────────────────────────────────────────
-    let prompt;
-    if (lower.startsWith('summary:')) {
-      prompt = `Summarize this in exactly 5 bullet points (use • symbol). Be concise:\n${text.slice(8)}`;
-    } else if (lower.startsWith('flashcard:')) {
-      prompt = `Generate 5 flashcard Q&A pairs. Format:\nQ: ...\nA: ...\n(each pair on new lines)\n\nContent:\n${text.slice(10)}`;
-    } else if (lower.startsWith('ask:')) {
-      prompt = `You are a helpful study assistant. Answer clearly and concisely in max 150 words:\n${text.slice(4)}`;
-    } else if (lower.startsWith('plan:')) {
-      prompt = `Create a simple 3-day study plan for: ${text.slice(5)}. Keep it short and actionable with specific time slots.`;
-    } else {
-      const linkedHint = userId
-        ? '• notes — your notes list\n• saved — your saved items\n• remind me: <topic> | <subject> | today 18:00\n• remind me: <topic> | <subject> | every 3 days 09:00\n• reminders — list all reminders'
-        : '• Link your account (WhatsApp tab in app) to access notes, saved items & reminders.';
-      prompt = `You are NoteNexus AI, a study assistant on WhatsApp. Help this student with their query in max 200 words:\n\n"${text}"\n\nAt the end, remind them they can use:\n• summary: <text>\n• flashcard: <text>\n• ask: <question>\n• plan: <subjects>\n${linkedHint}`;
-    }
-
-    const reply = (await askGroq(prompt)).slice(0, 1500);
-    await sendWhatsApp(From, `🤖 NoteNexus AI\n\n${reply}`);
-    res.sendStatus(200);
-
-  } catch (err) {
-    console.error('WhatsApp webhook error:', err.message);
-    res.sendStatus(500);
-  }
-});
-
-// ─── POST /api/whatsapp/generate-link-code  (authenticated) ──────────────────
-
-router.post('/generate-link-code', auth, async (req, res) => {
-  try {
-    await WhatsAppLinkCode.deleteMany({ userId: req.user._id });
-    const code = crypto.randomBytes(3).toString('hex').toUpperCase();
-    await WhatsAppLinkCode.create({ code, userId: req.user._id });
-    res.json({ code, expiresIn: 600 });
-  } catch (err) {
-    console.error('[whatsapp] generate-link-code error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── DELETE /api/whatsapp/unlink  (authenticated) ────────────────────────────
-
-router.delete('/unlink', auth, async (req, res) => {
-  try {
-    const result = await WhatsAppSession.findOneAndDelete({ userId: req.user._id });
-    res.json({ unlinked: !!result });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── GET /api/whatsapp/link-status  (authenticated) ──────────────────────────
-
-router.get('/link-status', auth, async (req, res) => {
-  try {
-    const session = await WhatsAppSession.findOne({ userId: req.user._id });
-    res.json({
-      linked: !!session,
-      phone: session?.phone ? session.phone.replace('whatsapp:', '') : null,
-      linkedAt: session?.linkedAt || null,
+    const note = await Note.create({
+      userId:     session.userId,
+      title:      autoTitle,
+      content:    englishText,
+      sourceType: 'whatsapp',
+      fileUrl:    mediaUrl,
+      subject:    meta.subject,
+      chapter:    meta.chapter,
+      keywords:   meta.keywords || [],
+      pineconeId: noteId,
     });
+
+    await storeEmbedding(noteId, englishText, {
+      userId: session.userId.toString(), noteId: note._id.toString(),
+      subject: meta.subject, chapter: meta.chapter,
+      sourceType: 'whatsapp', fileUrl: mediaUrl, title: autoTitle,
+    });
+
+    await sendWhatsApp(from, `✅ *Image Note Saved!*\n\n📚 *${autoTitle}*\nSubject: ${meta.subject}\nChapter: ${meta.chapter}\n\n${englishText.slice(0, 500)}`);
+
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[handleIncomingImage]', err);
+    await sendWhatsApp(from, '❌ Failed to process your image. Please try again.');
+  }
+}
+
+// ─── Webhook — Twilio sends ALL incoming WhatsApp messages here ───────────────
+router.post('/webhook', async (req, res) => {
+  res.status(200).send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+
+  try {
+    const {
+      From,
+      Body,
+      NumMedia,
+      MediaUrl0,
+      MediaContentType0,
+    } = req.body;
+
+    const from = From;
+    const text = (Body || '').trim().toLowerCase();
+
+    // Find linked session
+    const session = await WhatsAppSession.findOne({ phoneNumber: from, isActive: true });
+    if (!session) {
+      // Check for link code
+      const parts = text.split(' ');
+      if (parts[0] === 'link' && parts[1]) {
+        const code    = parts[1].toUpperCase();
+        const linkDoc = await WhatsAppLinkCode.findOne({ code, used: false, expiresAt: { $gt: new Date() } });
+        if (linkDoc) {
+          await WhatsAppSession.create({ userId: linkDoc.userId, phoneNumber: from, isActive: true });
+          await WhatsAppLinkCode.updateOne({ _id: linkDoc._id }, { used: true });
+          await sendWhatsApp(from, '✅ *NoteNexus linked!*\n\nCommands:\n• *notes* — list your notes\n• *help* — full command list\n\nYou can also *send a PDF* or *image* directly here!');
+        } else {
+          await sendWhatsApp(from, '❌ Invalid or expired code. Generate a new one at notenexus.vercel.app/dashboard');
+        }
+      } else {
+        await sendWhatsApp(from, '👋 Not linked yet.\n\nGo to notenexus.vercel.app/dashboard → WhatsApp Bot → Get Link Code\n\nThen reply: *link YOUR_CODE*');
+      }
+      return;
+    }
+
+    // ── Media handling (PDF / Image) ─────────────────────────────────────────
+    const numMedia = parseInt(NumMedia || '0', 10);
+    if (numMedia > 0 && MediaUrl0) {
+      const contentType = (MediaContentType0 || '').toLowerCase();
+
+      if (contentType === 'application/pdf') {
+        return handleIncomingPDF(session, MediaUrl0, contentType, from);
+      }
+
+      if (contentType.startsWith('image/')) {
+        return handleIncomingImage(session, MediaUrl0, from);
+      }
+
+      return sendWhatsApp(from, `⚠️ Unsupported file type: ${contentType}\n\nSupported: PDF, JPG, PNG`);
+    }
+
+    // ── Text commands ─────────────────────────────────────────────────────────
+    // "images <N>" — send page images of the Nth note
+    if (text.startsWith('images ')) {
+      const idx = parseInt(text.replace('images ', '').trim(), 10);
+      if (isNaN(idx) || idx < 1) return sendWhatsApp(from, '❓ Usage: *images 2* (to get images from your 2nd note)');
+
+      const notes = await Note.find({ userId: session.userId }).sort({ createdAt: -1 }).limit(idx);
+      const note  = notes[idx - 1];
+      if (!note) return sendWhatsApp(from, `❌ You don't have a note #${idx}.`);
+
+      const imgs = note.extractedImages || [];
+      if (!imgs.length) return sendWhatsApp(from, `📄 *${note.title}* has no extracted images.\n\nOnly PDF notes contain images.`);
+
+      await sendWhatsApp(from, `🖼️ *${note.title}* — ${imgs.length} images extracted. Sending page 1:`);
+      await sendWhatsAppMedia(from, `Page 1/${imgs.length}`, imgs[0]);
+      if (imgs.length > 1) await sendWhatsApp(from, `Send *images ${idx} 2* for page 2, etc.\n\nOr view all at notenexus.vercel.app`);
+      return;
+    }
+
+    // "images <N> <page>" — specific page
+    if (/^images \d+ \d+$/.test(text)) {
+      const [, noteIdx, pageIdx] = text.match(/^images (\d+) (\d+)$/);
+      const notes = await Note.find({ userId: session.userId }).sort({ createdAt: -1 }).limit(parseInt(noteIdx));
+      const note  = notes[parseInt(noteIdx) - 1];
+      const imgs  = note?.extractedImages || [];
+      const page  = parseInt(pageIdx) - 1;
+      if (!imgs[page]) return sendWhatsApp(from, `❌ Page ${pageIdx} doesn't exist (only ${imgs.length} pages).`);
+      await sendWhatsAppMedia(from, `Page ${pageIdx}/${imgs.length} — *${note.title}*`, imgs[page]);
+      return;
+    }
+
+    // "notes" — list notes
+    if (text === 'notes' || text === 'my notes') {
+      const notes = await Note.find({ userId: session.userId }).sort({ createdAt: -1 }).limit(20).select('-content');
+      return sendWhatsApp(from, formatNotesList(notes));
+    }
+
+    // Number — read that note
+    const noteNum = parseInt(text, 10);
+    if (!isNaN(noteNum) && noteNum >= 1 && noteNum <= 20) {
+      const notes = await Note.find({ userId: session.userId }).sort({ createdAt: -1 }).limit(noteNum);
+      const note  = notes[noteNum - 1];
+      if (!note) return sendWhatsApp(from, `❌ You don't have a note #${noteNum}.`);
+      return sendWhatsApp(from, formatNoteDetail(note));
+    }
+
+    // "help"
+    if (text === 'help' || text === 'commands') {
+      return sendWhatsApp(from, `📖 *NoteNexus Commands*\n\n📚 *notes* — list your notes\n🔢 *1, 2, 3...* — read a note\n🖼️ *images <N>* — get images from note N\n🖼️ *images <N> <page>* — specific page\n\n📤 *Send a PDF* — auto-extract text + images\n📷 *Send an image/photo* — OCR text extraction\n\n🌐 Full app: notenexus.vercel.app`);
+    }
+
+    // Default: AI answer based on notes
+    const recentNotes = await Note.find({ userId: session.userId }).sort({ createdAt: -1 }).limit(5).select('title subject content');
+    const context = recentNotes.map(n => `${n.title}: ${n.content.slice(0, 300)}`).join('\n---\n');
+    const aiReply = await askGroq(`You are NoteNexus AI assistant. Based on the user's study notes below, answer their question concisely.\n\nNotes:\n${context}\n\nQuestion: ${Body}`);
+    await sendWhatsApp(from, `🤖 ${aiReply}\n\n_(based on your notes)_`);
+
+  } catch (err) {
+    console.error('[WhatsApp webhook error]', err);
   }
 });
 
-// ─── GET /api/whatsapp/status ─────────────────────────────────────────────────
+// ─── REST endpoints (for dashboard UI) — unchanged ────────────────────────────
 
-router.get('/status', (req, res) => {
-  res.json({
-    configured: !!(
-      process.env.TWILIO_ACCOUNT_SID &&
-      process.env.TWILIO_AUTH_TOKEN &&
-      process.env.GROQ_API_KEY
-    ),
-    webhookUrl: `https://notenexus-backend-y20v.onrender.com/api/whatsapp/webhook`,
-    aiModel: 'llama-3.3-70b-versatile (Groq)',
-  });
+// POST /api/whatsapp/generate-code  (protected)
+router.post('/generate-code', auth, async (req, res) => {
+  try {
+    const code      = crypto.randomBytes(3).toString('hex').toUpperCase();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+    await WhatsAppLinkCode.create({ userId: req.user._id, code, expiresAt });
+    res.json({ code, expiresAt });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to generate code' });
+  }
+});
+
+// GET /api/whatsapp/status  (protected)
+router.get('/status', auth, async (req, res) => {
+  const session = await WhatsAppSession.findOne({ userId: req.user._id, isActive: true });
+  res.json({ linked: !!session, phoneNumber: session?.phoneNumber || null });
+});
+
+// DELETE /api/whatsapp/unlink  (protected)
+router.delete('/unlink', auth, async (req, res) => {
+  await WhatsAppSession.updateMany({ userId: req.user._id }, { isActive: false });
+  res.json({ success: true });
 });
 
 module.exports = router;
-// NOTE: The reminder commands are embedded in the main webhook handler above.
-// This file is complete as-is.

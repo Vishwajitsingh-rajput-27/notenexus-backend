@@ -1,9 +1,20 @@
+// routes/notes.js  —  NoteNexus
+// CHANGES:
+//   • POST /upload now calls extractImagesFromPDF and stores results in note.extractedImages
+//   • GET  /:id/images  — new endpoint returns extracted images for a note
+
 const express      = require('express');
 const asyncHandler = require('express-async-handler');
 const Note         = require('../models/Note');
-const protect = require('../middleware/auth');
+const protect      = require('../middleware/auth');
 const { upload }   = require('../config/cloudinary');
-const { extractFromImage, extractFromPDF, extractFromYouTube, extractFromVoice } = require('../services/ingestionService');
+const {
+  extractFromImage,
+  extractFromPDF,
+  extractFromYouTube,
+  extractFromVoice,
+  extractImagesFromPDF,      // ← NEW import
+} = require('../services/ingestionService');
 const { detectSubjectChapter, translateToEnglish } = require('../services/aiService');
 const { storeEmbedding, deleteEmbedding } = require('../services/vectorService');
 const { v4: uuidv4 } = require('uuid');
@@ -16,17 +27,34 @@ router.post('/upload', upload.single('file'), asyncHandler(async (req, res) => {
   const { sourceType, youtubeUrl, title } = req.body;
   const userId = req.user._id.toString();
 
-  let extractedText = '';
-  let fileUrl = '';
+  let extractedText   = '';
+  let fileUrl         = '';
+  let extractedImages = [];   // ← NEW
 
   if (sourceType === 'youtube' && youtubeUrl) {
     extractedText = await extractFromYouTube(youtubeUrl);
-    fileUrl = youtubeUrl;
+    fileUrl       = youtubeUrl;
+
   } else if (req.file) {
-    fileUrl = req.file.path;
-    if (sourceType === 'pdf')   extractedText = await extractFromPDF(fileUrl);
+    fileUrl = req.file.path;   // Cloudinary secure_url
+
+    if (sourceType === 'pdf') {
+      // Run text extraction and image extraction in parallel
+      const [text, imgResult] = await Promise.all([
+        extractFromPDF(fileUrl),
+        extractImagesFromPDF(fileUrl, { maxPages: 20, extractEmbedded: true }),
+      ]);
+      extractedText   = text;
+      extractedImages = [
+        ...imgResult.pageImages,
+        ...imgResult.embeddedImages,
+      ];
+      console.log(`[notes/upload] PDF → ${extractedImages.length} images extracted.`);
+    }
+
     if (sourceType === 'image') extractedText = await extractFromImage(fileUrl);
     if (sourceType === 'voice') extractedText = await extractFromVoice(fileUrl);
+
   } else {
     return res.status(400).json({ message: 'Provide a file or YouTube URL' });
   }
@@ -39,20 +67,21 @@ router.post('/upload', upload.single('file'), asyncHandler(async (req, res) => {
   console.log('Checking language and translating if needed...');
   const englishText = await translateToEnglish(extractedText);
 
-  const meta     = await detectSubjectChapter(englishText);
-  const noteId   = uuidv4();
+  const meta      = await detectSubjectChapter(englishText);
+  const noteId    = uuidv4();
   const autoTitle = title || `${meta.subject} — ${meta.chapter}`;
 
   const note = await Note.create({
     userId,
-    title: autoTitle,
-    content: englishText,        // Save translated English content
+    title:           autoTitle,
+    content:         englishText,
     sourceType,
     fileUrl,
-    subject:   meta.subject,
-    chapter:   meta.chapter,
-    keywords:  meta.keywords || [],
-    pineconeId: noteId,
+    subject:         meta.subject,
+    chapter:         meta.chapter,
+    keywords:        meta.keywords || [],
+    pineconeId:      noteId,
+    extractedImages,                 // ← NEW: persist images
   });
 
   await storeEmbedding(noteId, englishText, {
@@ -66,15 +95,35 @@ router.post('/upload', upload.single('file'), asyncHandler(async (req, res) => {
   });
 
   res.status(201).json({
-    noteId:    note._id,
-    title:     autoTitle,
-    subject:   meta.subject,
-    chapter:   meta.chapter,
-    keywords:  meta.keywords,
+    noteId:         note._id,
+    title:          autoTitle,
+    subject:        meta.subject,
+    chapter:        meta.chapter,
+    keywords:       meta.keywords,
     sourceType,
     fileUrl,
-    preview:   englishText.slice(0, 300),
-    wordCount: englishText.split(/\s+/).length,
+    extractedImages,                 // ← NEW: send to frontend
+    imageCount:     extractedImages.length,
+    preview:        englishText.slice(0, 300),
+    wordCount:      englishText.split(/\s+/).length,
+  });
+}));
+
+// ── GET /api/notes/:id/images  (NEW) ──────────────────────────────────────────
+// Returns just the extractedImages array for a note.
+// Useful for lazy-loading the gallery after the initial upload response.
+router.get('/:id/images', asyncHandler(async (req, res) => {
+  const note = await Note.findOne(
+    { _id: req.params.id, userId: req.user._id },
+    'extractedImages fileUrl title sourceType'
+  );
+  if (!note) return res.status(404).json({ message: 'Note not found' });
+
+  res.json({
+    noteId:         note._id,
+    title:          note.title,
+    extractedImages: note.extractedImages || [],
+    imageCount:     (note.extractedImages || []).length,
   });
 }));
 
@@ -83,7 +132,10 @@ router.get('/', asyncHandler(async (req, res) => {
   const { subject, limit = 50 } = req.query;
   const query = { userId: req.user._id };
   if (subject) query.subject = subject;
-  const notes = await Note.find(query).sort({ createdAt: -1 }).limit(Number(limit)).select('-content');
+  const notes = await Note.find(query)
+    .sort({ createdAt: -1 })
+    .limit(Number(limit))
+    .select('-content');
   res.json({ notes, count: notes.length });
 }));
 
@@ -95,7 +147,11 @@ router.get('/subjects', asyncHandler(async (req, res) => {
 
 // ── GET /api/notes/shared ──────────────────────────────────────────────────
 router.get('/shared', asyncHandler(async (req, res) => {
-  const notes = await Note.find({ isShared: true }).sort({ upvotes: -1 }).limit(30).select('-content').populate('userId', 'name');
+  const notes = await Note.find({ isShared: true })
+    .sort({ upvotes: -1 })
+    .limit(30)
+    .select('-content')
+    .populate('userId', 'name');
   res.json({ notes, count: notes.length });
 }));
 
@@ -129,7 +185,7 @@ router.patch('/:id/share', asyncHandler(async (req, res) => {
 router.post('/:id/upvote', asyncHandler(async (req, res) => {
   const note = await Note.findById(req.params.id);
   if (!note) return res.status(404).json({ message: 'Note not found' });
-  const uid = req.user._id.toString();
+  const uid    = req.user._id.toString();
   const already = note.upvotedBy.map(String).includes(uid);
   if (already) {
     note.upvotes   -= 1;
