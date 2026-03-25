@@ -488,7 +488,14 @@ const extractImagesFromPDF = async (pdfUrl, options = {}) => {
 
   // ── A) Render each page and upload to Cloudinary ──────────────────────────
   try {
-    const { createCanvas } = require('canvas');
+    let createCanvas;
+    try {
+      ({ createCanvas } = require('canvas'));
+      const _t = createCanvas(4, 4); _t.getContext('2d'); // verify native bindings
+    } catch (canvasErr) {
+      console.warn(`[extractImagesFromPDF] canvas unavailable (${canvasErr.message}) — skipping page images.`);
+      return results; // gracefully return empty, don't crash the upload
+    }
 
     for (let pg = 1; pg <= pageCount; pg++) {
       try {
