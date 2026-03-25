@@ -1,11 +1,5 @@
 // routes/whatsapp.js — NoteNexus WhatsApp Bot
-//
-// Features:
-//   • Link WhatsApp to user account via 6-digit code
-//   • Send PDFs → auto-extract text + images, save as Note
-//   • Send images → OCR text extraction, save as Note
-//   • Text commands: notes, saved, reminders, AI help
-//   • View extracted images from PDF notes
+// Complete fixed version
 
 const express = require('express');
 const router = express.Router();
@@ -30,6 +24,104 @@ const {
 } = require('../services/ingestionService');
 const { detectSubjectChapter, translateToEnglish } = require('../services/aiService');
 const { storeEmbedding } = require('../services/vectorService');
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEBUG ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+router.get('/webhook', (req, res) => {
+  console.log('[webhook GET] Webhook is reachable');
+  res.send('✅ WhatsApp webhook is active. Use POST for Twilio messages.');
+});
+
+router.get('/debug-env', (req, res) => {
+  res.json({
+    timestamp: new Date().toISOString(),
+    TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID ? `SET (${process.env.TWILIO_ACCOUNT_SID.slice(0, 4)}...)` : '❌ MISSING',
+    TWILIO_AUTH_TOKEN: process.env.TWILIO_AUTH_TOKEN ? `SET (${process.env.TWILIO_AUTH_TOKEN.slice(0, 4)}...)` : '❌ MISSING',
+    TWILIO_WHATSAPP_NUMBER: process.env.TWILIO_WHATSAPP_NUMBER || '❌ MISSING',
+    NODE_ENV: process.env.NODE_ENV || 'not set',
+  });
+});
+
+router.get('/test-twilio', async (req, res) => {
+  try {
+    if (!process.env.TWILIO_ACCOUNT_SID) {
+      return res.json({ success: false, error: 'TWILIO_ACCOUNT_SID not set' });
+    }
+    if (!process.env.TWILIO_AUTH_TOKEN) {
+      return res.json({ success: false, error: 'TWILIO_AUTH_TOKEN not set' });
+    }
+    if (!process.env.TWILIO_WHATSAPP_NUMBER) {
+      return res.json({ success: false, error: 'TWILIO_WHATSAPP_NUMBER not set' });
+    }
+
+    let twilio;
+    try {
+      twilio = require('twilio');
+    } catch (err) {
+      return res.json({ success: false, error: 'Twilio package not installed. Run: npm install twilio' });
+    }
+
+    const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    const account = await client.api.accounts(process.env.TWILIO_ACCOUNT_SID).fetch();
+
+    res.json({
+      success: true,
+      message: '✅ Twilio credentials are valid',
+      account: {
+        sid: account.sid,
+        friendlyName: account.friendlyName,
+        status: account.status,
+      },
+      whatsappNumber: process.env.TWILIO_WHATSAPP_NUMBER,
+    });
+  } catch (err) {
+    res.json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
+router.get('/debug-codes', async (req, res) => {
+  try {
+    const allCodes = await WhatsAppLinkCode.find({}).sort({ createdAt: -1 }).limit(10);
+    const activeCodes = await WhatsAppLinkCode.find({ used: false, expiresAt: { $gt: new Date() } });
+
+    res.json({
+      success: true,
+      totalCodes: allCodes.length,
+      activeCodes: activeCodes.length,
+      recentCodes: allCodes.map(c => ({
+        code: c.code,
+        used: c.used,
+        expiresAt: c.expiresAt,
+        expired: c.expiresAt < new Date(),
+        createdAt: c.createdAt,
+      })),
+    });
+  } catch (err) {
+    res.json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
+// Temporary endpoint to clean up duplicate sessions
+router.delete('/reset/:phone', async (req, res) => {
+  try {
+    const phone = `whatsapp:+${req.params.phone}`;
+    const result = await WhatsAppSession.deleteMany({ phone });
+    res.json({
+      success: true,
+      message: `Deleted ${result.deletedCount} sessions for ${phone}`,
+    });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GROQ AI HELPER
@@ -61,12 +153,8 @@ async function askGroq(prompt) {
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          if (parsed.error) {
-            return reject(new Error(parsed.error.message));
-          }
-          if (!parsed.choices?.[0]?.message?.content) {
-            return reject(new Error('Empty response from Groq'));
-          }
+          if (parsed.error) return reject(new Error(parsed.error.message));
+          if (!parsed.choices?.[0]?.message?.content) return reject(new Error('Empty response'));
           resolve(parsed.choices[0].message.content);
         } catch (e) {
           reject(e);
@@ -97,6 +185,12 @@ function getTwilioClient() {
 
 async function sendWhatsApp(to, body) {
   try {
+    // Don't send if To = From (would cause error)
+    if (to === process.env.TWILIO_WHATSAPP_NUMBER) {
+      console.log('[sendWhatsApp] ⚠️ Skipping - cannot send to same number as From');
+      return;
+    }
+
     const client = getTwilioClient();
     await client.messages.create({
       from: process.env.TWILIO_WHATSAPP_NUMBER,
@@ -111,6 +205,11 @@ async function sendWhatsApp(to, body) {
 
 async function sendWhatsAppMedia(to, body, mediaUrl) {
   try {
+    if (to === process.env.TWILIO_WHATSAPP_NUMBER) {
+      console.log('[sendWhatsAppMedia] ⚠️ Skipping - cannot send to same number');
+      return;
+    }
+
     const client = getTwilioClient();
     await client.messages.create({
       from: process.env.TWILIO_WHATSAPP_NUMBER,
@@ -193,7 +292,6 @@ function fetchBuffer(urlStr) {
 
     const headers = {};
 
-    // Twilio media URLs require authentication
     if (parsed.hostname.includes('twilio.com')) {
       headers['Authorization'] =
         'Basic ' +
@@ -231,11 +329,9 @@ async function handleIncomingPDF(session, mediaUrl, mediaContentType, from) {
   try {
     await sendWhatsApp(from, '📄 PDF received! Processing text and extracting images... ⏳');
 
-    // Download PDF
     const pdfBuffer = await fetchBuffer(mediaUrl);
     console.log('[handleIncomingPDF] Downloaded PDF, size:', pdfBuffer.length);
 
-    // Upload PDF to Cloudinary
     const uploadedPdf = await new Promise((resolve, reject) => {
       const stream = cloudinary.uploader.upload_stream(
         { resource_type: 'raw', format: 'pdf', folder: 'notenexus/whatsapp-pdfs' },
@@ -250,7 +346,6 @@ async function handleIncomingPDF(session, mediaUrl, mediaContentType, from) {
     const pdfCloudinaryUrl = uploadedPdf.secure_url;
     console.log('[handleIncomingPDF] Uploaded to Cloudinary:', pdfCloudinaryUrl);
 
-    // Extract text + images in parallel
     const [extractedText, imgResult] = await Promise.all([
       extractFromPDF(pdfCloudinaryUrl),
       extractImagesFromPDF(pdfCloudinaryUrl, { maxPages: 10, extractEmbedded: true }),
@@ -293,12 +388,10 @@ async function handleIncomingPDF(session, mediaUrl, mediaContentType, from) {
       title: autoTitle,
     });
 
-    // Reply with summary
     const summary = `✅ *PDF Saved!*\n\n📚 *${autoTitle}*\nSubject: ${meta.subject}\nChapter: ${meta.chapter}\nKeywords: ${(meta.keywords || []).slice(0, 5).join(', ')}\n🖼️ ${allImages.length} images extracted\n📝 ${englishText.split(/\s+/).length} words\n\n${englishText.slice(0, 400)}${englishText.length > 400 ? '...' : ''}`;
 
     await sendWhatsApp(from, summary);
 
-    // Send the first page image back if available
     if (allImages.length > 0) {
       await sendWhatsAppMedia(
         from,
@@ -378,7 +471,13 @@ async function handleIncomingImage(session, mediaUrl, from) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 router.post('/webhook', async (req, res) => {
-  // Respond immediately to Twilio (prevents timeout retries)
+  console.log('═══════════════════════════════════════════════════════');
+  console.log('[webhook] 📥 INCOMING MESSAGE');
+  console.log('[webhook] From:', req.body.From);
+  console.log('[webhook] Body:', req.body.Body);
+  console.log('[webhook] NumMedia:', req.body.NumMedia);
+  console.log('═══════════════════════════════════════════════════════');
+
   res.status(200).send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
 
   try {
@@ -387,18 +486,24 @@ router.post('/webhook', async (req, res) => {
     const from = From;
     const text = (Body || '').trim().toLowerCase();
 
+    // IGNORE messages FROM the Twilio number itself
+    if (from === process.env.TWILIO_WHATSAPP_NUMBER) {
+      console.log('[webhook] ⚠️ Ignoring message from Twilio number itself');
+      return;
+    }
+
     console.log('[webhook] Message from:', from, '| Text:', text, '| NumMedia:', NumMedia);
 
-    // Find linked session
     const session = await WhatsAppSession.findOne({ phone: from, isActive: true });
+    console.log('[webhook] Session found:', !!session);
 
     if (!session) {
-      // Check for link code
       const parts = text.split(' ');
+      console.log('[webhook] Not linked. Parts:', parts);
 
       if (parts[0] === 'link' && parts[1]) {
         const code = parts[1].toUpperCase();
-        console.log('[webhook] Link attempt with code:', code);
+        console.log('[webhook] 🔗 Link attempt with code:', code);
 
         const linkDoc = await WhatsAppLinkCode.findOne({
           code,
@@ -406,27 +511,59 @@ router.post('/webhook', async (req, res) => {
           expiresAt: { $gt: new Date() },
         });
 
+        console.log('[webhook] LinkCode found:', !!linkDoc);
+
         if (linkDoc) {
-          await WhatsAppSession.create({
-            userId: linkDoc.userId,
-            phone: from,
-            isActive: true,
-          });
+          // ============================================================
+          // FIX: Check if session already exists, update instead of create
+          // ============================================================
+          const existingSession = await WhatsAppSession.findOne({ phone: from });
+
+          if (existingSession) {
+            console.log('[webhook] ⚠️ Session already exists, updating...');
+            
+            await WhatsAppSession.updateOne(
+              { phone: from },
+              {
+                userId: linkDoc.userId,
+                isActive: true,
+                linkedAt: new Date(),
+              }
+            );
+            console.log('[webhook] ✅ Existing session updated');
+          } else {
+            const newSession = await WhatsAppSession.create({
+              userId: linkDoc.userId,
+              phone: from,
+              isActive: true,
+            });
+            console.log('[webhook] ✅ New session created:', newSession._id);
+          }
 
           await WhatsAppLinkCode.updateOne({ _id: linkDoc._id }, { used: true });
+          console.log('[webhook] ✅ Code marked as used');
 
           await sendWhatsApp(
             from,
             '✅ *NoteNexus linked!*\n\nCommands:\n• *notes* — list your notes\n• *help* — full command list\n\nYou can also *send a PDF* or *image* directly here!'
           );
 
-          console.log('[webhook] ✅ Account linked successfully');
+          console.log('[webhook] ✅ Success message sent');
         } else {
+          const anyCode = await WhatsAppLinkCode.findOne({ code });
+          if (anyCode) {
+            console.log('[webhook] Found code but invalid:', {
+              code: anyCode.code,
+              used: anyCode.used,
+              expiresAt: anyCode.expiresAt,
+              expired: anyCode.expiresAt < new Date(),
+            });
+          }
+
           await sendWhatsApp(
             from,
             '❌ Invalid or expired code. Generate a new one at notenexus.vercel.app/dashboard'
           );
-          console.log('[webhook] ❌ Invalid or expired code');
         }
       } else {
         await sendWhatsApp(
@@ -437,12 +574,12 @@ router.post('/webhook', async (req, res) => {
       return;
     }
 
-    // ── Media handling (PDF / Image) ─────────────────────────────────────────
+    // Media handling
     const numMedia = parseInt(NumMedia || '0', 10);
 
     if (numMedia > 0 && MediaUrl0) {
       const contentType = (MediaContentType0 || '').toLowerCase();
-      console.log('[webhook] Media received, type:', contentType);
+      console.log('[webhook] 📎 Media received, type:', contentType);
 
       if (contentType === 'application/pdf') {
         return handleIncomingPDF(session, MediaUrl0, contentType, from);
@@ -455,9 +592,21 @@ router.post('/webhook', async (req, res) => {
       return sendWhatsApp(from, `⚠️ Unsupported file type: ${contentType}\n\nSupported: PDF, JPG, PNG`);
     }
 
-    // ── Text commands ─────────────────────────────────────────────────────────
+    // Text commands
+    console.log('[webhook] 💬 Processing text command:', text);
 
-    // "images <N>" — send page images of the Nth note
+    // "unlink" command
+    if (text === 'unlink' || text === 'disconnect') {
+      await WhatsAppSession.updateOne({ phone: from }, { isActive: false });
+      await sendWhatsApp(
+        from,
+        '✅ Account unlinked.\n\nTo link again, generate a new code at notenexus.vercel.app/dashboard'
+      );
+      console.log('[webhook] ✅ Session unlinked');
+      return;
+    }
+
+    // "images <N>"
     if (text.startsWith('images ')) {
       const idx = parseInt(text.replace('images ', '').trim(), 10);
 
@@ -493,7 +642,7 @@ router.post('/webhook', async (req, res) => {
       return;
     }
 
-    // "images <N> <page>" — specific page
+    // "images <N> <page>"
     if (/^images \d+ \d+$/.test(text)) {
       const [, noteIdx, pageIdx] = text.match(/^images (\d+) (\d+)$/);
       const notes = await Note.find({ userId: session.userId })
@@ -511,7 +660,7 @@ router.post('/webhook', async (req, res) => {
       return;
     }
 
-    // "notes" — list notes
+    // "notes"
     if (text === 'notes' || text === 'my notes') {
       const notes = await Note.find({ userId: session.userId })
         .sort({ createdAt: -1 })
@@ -520,7 +669,7 @@ router.post('/webhook', async (req, res) => {
       return sendWhatsApp(from, formatNotesList(notes));
     }
 
-    // Number — read that note
+    // Number
     const noteNum = parseInt(text, 10);
     if (!isNaN(noteNum) && noteNum >= 1 && noteNum <= 20) {
       const notes = await Note.find({ userId: session.userId }).sort({ createdAt: -1 }).limit(noteNum);
@@ -537,11 +686,12 @@ router.post('/webhook', async (req, res) => {
     if (text === 'help' || text === 'commands') {
       return sendWhatsApp(
         from,
-        `📖 *NoteNexus Commands*\n\n📚 *notes* — list your notes\n🔢 *1, 2, 3...* — read a note\n🖼️ *images <N>* — get images from note N\n🖼️ *images <N> <page>* — specific page\n\n📤 *Send a PDF* — auto-extract text + images\n📷 *Send an image/photo* — OCR text extraction\n\n🌐 Full app: notenexus.vercel.app`
+        `📖 *NoteNexus Commands*\n\n📚 *notes* — list your notes\n🔢 *1, 2, 3...* — read a note\n🖼️ *images <N>* — get images from note N\n🖼️ *images <N> <page>* — specific page\n🔗 *unlink* — disconnect this WhatsApp\n\n📤 *Send a PDF* — auto-extract text + images\n📷 *Send an image/photo* — OCR text extraction\n\n🌐 Full app: notenexus.vercel.app`
       );
     }
 
-    // Default: AI answer based on notes
+    // AI response
+    console.log('[webhook] 🤖 Generating AI response...');
     const recentNotes = await Note.find({ userId: session.userId })
       .sort({ createdAt: -1 })
       .limit(5)
@@ -554,8 +704,11 @@ router.post('/webhook', async (req, res) => {
     );
 
     await sendWhatsApp(from, `🤖 ${aiReply}\n\n_(based on your notes)_`);
+    console.log('[webhook] ✅ AI response sent');
+
   } catch (err) {
-    console.error('[webhook] ❌ Error:', err);
+    console.error('[webhook] ❌ ERROR:', err.message);
+    console.error('[webhook] Stack:', err.stack);
   }
 });
 
@@ -563,7 +716,6 @@ router.post('/webhook', async (req, res) => {
 // REST ENDPOINTS (for dashboard UI)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Debug endpoint (remove in production)
 router.get('/debug', auth, async (req, res) => {
   try {
     res.json({
@@ -583,23 +735,19 @@ router.get('/debug', auth, async (req, res) => {
   }
 });
 
-// Generate link code
 async function handleGenerateCode(req, res) {
   try {
     console.log('[generateCode] Request from user:', req.user._id.toString(), req.user.email);
 
-    // Generate 6-character uppercase code
     const code = crypto.randomBytes(3).toString('hex').toUpperCase();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
-    // Delete any existing unused codes for this user
     const deleted = await WhatsAppLinkCode.deleteMany({
       userId: req.user._id,
       used: false,
     });
     console.log('[generateCode] Deleted old codes:', deleted.deletedCount);
 
-    // Create new code
     const linkDoc = await WhatsAppLinkCode.create({
       userId: req.user._id,
       code,
@@ -628,7 +776,6 @@ async function handleGenerateCode(req, res) {
 router.post('/generate-code', auth, handleGenerateCode);
 router.post('/generate-link-code', auth, handleGenerateCode);
 
-// Get status
 router.get('/status', auth, async (req, res) => {
   try {
     const configured = !!(
@@ -656,7 +803,6 @@ router.get('/status', auth, async (req, res) => {
   }
 });
 
-// Get link status
 router.get('/link-status', auth, async (req, res) => {
   try {
     const session = await WhatsAppSession.findOne({
@@ -674,7 +820,6 @@ router.get('/link-status', auth, async (req, res) => {
   }
 });
 
-// Unlink account
 router.delete('/unlink', auth, async (req, res) => {
   try {
     const result = await WhatsAppSession.updateMany(
