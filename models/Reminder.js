@@ -25,7 +25,10 @@ const reminderSchema = new mongoose.Schema({
   sendWhatsApp:   { type: Boolean, default: false },
 }, { timestamps: true });
 
+// Compound indexes for performance
+reminderSchema.index({ user: 1, active: 1 });
 reminderSchema.index({ active: 1, nextReminder: 1 });
+
 reminderSchema.set('toJSON', { virtuals: true });
 
 module.exports = mongoose.model('Reminder', reminderSchema);
