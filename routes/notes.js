@@ -39,8 +39,7 @@ router.post('/upload', upload.single('file'), asyncHandler(async (req, res) => {
     fileUrl = req.file.path;   // Cloudinary secure_url
 
     if (sourceType === 'pdf') {
-      // Run text extraction and image extraction in parallel.
-      // Image extraction is best-effort — its failure must never block the upload.
+      // Run text extraction and image extraction in parallel
       const [text, imgResult] = await Promise.all([
         extractFromPDF(fileUrl),
         extractImagesFromPDF(fileUrl, { maxPages: 20, extractEmbedded: true })
