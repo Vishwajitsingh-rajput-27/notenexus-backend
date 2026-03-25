@@ -6,11 +6,18 @@
  *  1. pdf-parse  → fast embedded-text extraction (text-based PDFs)
  *  2. If <50 chars returned, PDF is image-based (scanned).
  *     → Render every page locally using pdfjs-dist + canvas
- *     → Send each rendered JPEG directly to Groq Vision OCR
+ *     → Try Groq Vision OCR first (fast, high quality)
+ *     → Fall back to tesseract.js if Groq Vision fails or returns empty
  *     → No Cloudinary pg_N trick — works on all plans / environments
  *
- * Requires:  npm install canvas
- * (Cairo is pre-installed on Render's Node runtime — no Dockerfile needed)
+ * FIXES (v2):
+ *  - groqVision now checks HTTP status code — API errors no longer silently
+ *    resolve as empty string, they reject with the real error message.
+ *  - Page loop tracks firstPageError and includes it in the final throw,
+ *    so the real cause (wrong model, bad API key, rate limit) is visible.
+ *  - tesseract.js (already in package.json) is used as automatic fallback
+ *    when Groq Vision fails on any page — zero extra dependencies needed.
+ *  - GROQ_VISION_MODEL env var lets you change the model without a redeploy.
  */
 
 const pdfParse   = require('pdf-parse');
@@ -27,7 +34,6 @@ const fetchBuffer = (urlStr) =>
       const parsed  = new URL(urlStr);
       const lib     = parsed.protocol === 'https:' ? https : http;
 
-      // ADDED: Include Cloudinary auth if fetching from our own Cloudinary account
       const headers = {};
       if (parsed.hostname.includes('cloudinary.com')) {
         const config = cloudinary.config();
@@ -68,10 +74,15 @@ const fetchBuffer = (urlStr) =>
   });
 
 // ── Groq Vision API ───────────────────────────────────────────────────────────
+// FIX: now checks res.statusCode so API errors (wrong model, bad key, rate
+//      limit) are rejected with the real message instead of resolving as ''.
 const groqVision = (base64Data, mimeType, prompt) =>
   new Promise((resolve, reject) => {
+    // Allow overriding the vision model via env var without a redeploy.
+    const model = process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
+
     const body = JSON.stringify({
-      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+      model,
       messages: [{
         role: 'user',
         content: [
@@ -95,24 +106,58 @@ const groqVision = (base64Data, mimeType, prompt) =>
     };
 
     const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (c) => data += c);
+      // FIX: collect as Buffers, not string concatenation, to handle
+      //      multi-byte characters correctly in large responses.
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
         try {
-          const parsed = JSON.parse(data);
-          if (parsed.error) return reject(new Error(parsed.error.message));
+          const raw    = Buffer.concat(chunks).toString('utf8');
+          const parsed = JSON.parse(raw);
+
+          // FIX: check for API-level errors in the response body,
+          //      then check the HTTP status code.
+          if (parsed.error) {
+            const msg = parsed.error.message || JSON.stringify(parsed.error);
+            return reject(new Error(`Groq Vision API error (HTTP ${res.statusCode}): ${msg}`));
+          }
+          if (res.statusCode !== 200) {
+            return reject(new Error(`Groq Vision returned HTTP ${res.statusCode}: ${raw.slice(0, 300)}`));
+          }
+
           resolve(parsed.choices?.[0]?.message?.content?.trim() || '');
-        } catch (e) { reject(e); }
+        } catch (e) {
+          reject(new Error(`Failed to parse Groq Vision response: ${e.message}`));
+        }
       });
     });
     req.on('error', reject);
-    req.setTimeout(60000, () => {
+    req.setTimeout(90000, () => {   // increased to 90 s for large images
       req.destroy();
-      reject(new Error('Groq vision timeout'));
+      reject(new Error('Groq Vision timeout (90 s)'));
     });
     req.write(body);
     req.end();
   });
+
+// ── Tesseract.js OCR (local fallback — no API key needed) ─────────────────────
+// tesseract.js ^5.x is already in package.json.  Used when Groq Vision
+// fails or returns an empty string on a page — guarantees OCR always works.
+const tesseractOCR = async (jpegBuffer) => {
+  try {
+    const { createWorker } = require('tesseract.js');
+    const worker = await createWorker('eng', 1, {
+      logger: () => {},           // suppress progress noise in server logs
+      errorHandler: () => {},
+    });
+    const { data: { text } } = await worker.recognize(jpegBuffer);
+    await worker.terminate();
+    return (text || '').trim();
+  } catch (err) {
+    console.warn('[tesseractOCR] failed:', err.message);
+    return '';
+  }
+};
 
 // ── Groq Whisper API ──────────────────────────────────────────────────────────
 const groqWhisper = (audioBuffer, filename) =>
@@ -158,8 +203,9 @@ const groqWhisper = (audioBuffer, filename) =>
 
 // ── Extract text from PDF ─────────────────────────────────────────────────────
 // Step 1: pdf-parse for text-based PDFs (instant).
-// Step 2: pdfjs-dist + canvas renders each page as JPEG locally, then
-//         Groq Vision OCR — zero dependency on Cloudinary plan features.
+// Step 2: pdfjs-dist + canvas renders each page as JPEG locally, then:
+//   2a. Groq Vision OCR (fast, high quality).
+//   2b. If Groq Vision fails or returns empty → tesseract.js (reliable fallback).
 const extractFromPDF = async (pdfUrl) => {
   // ── Step 1: embedded text ─────────────────────────────────────────────────
   const buffer = await fetchBuffer(pdfUrl);
@@ -174,7 +220,6 @@ const extractFromPDF = async (pdfUrl) => {
   // ── Step 2: render pages locally and OCR ─────────────────────────────────
   console.log('[extractFromPDF] No embedded text — rendering pages locally for OCR...');
 
-  // Load pdfjs-dist (supports both CJS and ESM builds)
   let pdfjsLib;
   try {
     pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
@@ -187,53 +232,74 @@ const extractFromPDF = async (pdfUrl) => {
   const uint8Array = new Uint8Array(buffer);
   const pdfDoc     = await pdfjsLib.getDocument({
     data:            uint8Array,
-    useSystemFonts:  true,   // avoids font-worker errors in Node
+    useSystemFonts:  true,
     disableFontFace: true,
   }).promise;
 
   const pageCount = Math.min(pdfDoc.numPages, 20);
   console.log(`[extractFromPDF] ${pdfDoc.numPages} page(s) in PDF — processing ${pageCount}.`);
 
-  const pageTexts = [];
+  const pageTexts      = [];
+  let   firstPageError = null;   // FIX: track the real failure reason
 
   for (let pg = 1; pg <= pageCount; pg++) {
     try {
       const page     = await pdfDoc.getPage(pg);
-      const viewport = page.getViewport({ scale: 2.0 }); // ~150 dpi — good OCR quality
+      const viewport = page.getViewport({ scale: 2.0 });
 
       const canvas  = createCanvas(viewport.width, viewport.height);
       const context = canvas.getContext('2d');
 
       await page.render({ canvasContext: context, viewport }).promise;
 
-      // Convert to JPEG buffer — goes straight to Groq, no upload needed
       const jpegBuffer = canvas.toBuffer('image/jpeg', { quality: 0.92 });
       const base64     = jpegBuffer.toString('base64');
 
       console.log(`[extractFromPDF] Page ${pg}/${pageCount} rendered (${jpegBuffer.length} bytes) — OCR in progress...`);
 
-      const pageText = await groqVision(
-        base64,
-        'image/jpeg',
-        'Extract ALL text from this page image. Preserve layout and formatting. Return only the text, nothing else.'
-      );
+      // ── 2a. Try Groq Vision ───────────────────────────────────────────────
+      let pageText = '';
+      try {
+        pageText = await groqVision(
+          base64,
+          'image/jpeg',
+          'Extract ALL text from this page image. Preserve layout and formatting. Return only the text, nothing else.'
+        );
+      } catch (groqErr) {
+        // FIX: record the real error so we can surface it if everything fails
+        if (!firstPageError) firstPageError = groqErr;
+        console.warn(`[extractFromPDF] Page ${pg} Groq Vision failed: ${groqErr.message}`);
+      }
+
+      // ── 2b. Fallback to tesseract.js if Groq returned nothing ─────────────
+      if (!pageText || pageText.trim().length === 0) {
+        console.log(`[extractFromPDF] Page ${pg} — trying tesseract.js fallback...`);
+        pageText = await tesseractOCR(jpegBuffer);
+        if (pageText && pageText.trim().length > 0) {
+          console.log(`[extractFromPDF] Page ${pg} tesseract succeeded (${pageText.trim().length} chars).`);
+        } else {
+          console.warn(`[extractFromPDF] Page ${pg} — both Groq Vision and tesseract returned empty.`);
+        }
+      }
 
       if (pageText && pageText.trim().length > 0) {
         pageTexts.push(`--- Page ${pg} ---\n${pageText.trim()}`);
         console.log(`[extractFromPDF] Page ${pg} done (${pageText.trim().length} chars).`);
-      } else {
-        console.warn(`[extractFromPDF] Page ${pg} returned empty OCR result.`);
       }
 
-      page.cleanup(); // free canvas memory between pages
+      page.cleanup();
     } catch (err) {
+      if (!firstPageError) firstPageError = err;
       console.warn(`[extractFromPDF] Page ${pg} failed:`, err.message);
-      // Continue — one bad page must not abort the whole document
     }
   }
 
   if (pageTexts.length === 0) {
-    throw new Error('Could not extract text from source — vision OCR returned nothing.');
+    // FIX: include the real reason so developers know exactly what to fix
+    const detail = firstPageError
+      ? ` — ${firstPageError.message}`
+      : ' — vision OCR returned nothing';
+    throw new Error(`Could not extract text from source${detail}`);
   }
 
   return pageTexts.join('\n\n');
@@ -245,11 +311,29 @@ const extractFromImage = async (imageUrl) => {
   const base64 = buffer.toString('base64');
   const ext    = imageUrl.split('.').pop().toLowerCase().split('?')[0];
   const mime   = ext === 'png' ? 'image/png' : 'image/jpeg';
-  return groqVision(
-    base64,
-    mime,
-    'Extract ALL text from this image. Return only the extracted text, preserving layout. If no text, describe the image in detail for study notes.'
-  );
+
+  // Try Groq Vision first, fall back to tesseract.js
+  let result = '';
+  try {
+    result = await groqVision(
+      base64,
+      mime,
+      'Extract ALL text from this image. Return only the extracted text, preserving layout. If no text, describe the image in detail for study notes.'
+    );
+  } catch (groqErr) {
+    console.warn(`[extractFromImage] Groq Vision failed: ${groqErr.message} — trying tesseract fallback`);
+  }
+
+  if (!result || result.trim().length === 0) {
+    console.log('[extractFromImage] Groq returned empty — trying tesseract fallback...');
+    result = await tesseractOCR(buffer);
+  }
+
+  if (!result || result.trim().length === 0) {
+    throw new Error('Could not extract text from image — both Groq Vision and tesseract returned nothing');
+  }
+
+  return result;
 };
 
 // ── Extract from voice ────────────────────────────────────────────────────────
@@ -279,11 +363,6 @@ const extractFromYouTube = async (youtubeUrl) => {
 
 // ────────────────────────────────────────────────────────────────────────────
 // extractImagesFromPDF
-//
-//  A) Local page renders via pdfjs-dist + canvas → upload to Cloudinary
-//  B) Embedded image extraction via pdfjs-dist operator list
-//
-//  Returns: { pageImages: string[], embeddedImages: string[] }
 // ────────────────────────────────────────────────────────────────────────────
 const extractImagesFromPDF = async (pdfUrl, options = {}) => {
   const {
@@ -296,7 +375,6 @@ const extractImagesFromPDF = async (pdfUrl, options = {}) => {
     embeddedImages: [],
   };
 
-  // Load pdfjs-dist once for both A and B
   let pdfjsLib;
   try {
     pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
@@ -360,7 +438,7 @@ const extractImagesFromPDF = async (pdfUrl, options = {}) => {
         const imgNames = new Set();
 
         opList.fnArray.forEach((fn, i) => {
-          if (fn === 85 || fn === 83) { // paintImageXObject / paintInlineImageXObject
+          if (fn === 85 || fn === 83) {
             imgNames.add(opList.argsArray[i]?.[0]);
           }
         });
@@ -417,7 +495,7 @@ const rgbaToPng = (rgba, width, height) =>
       try {
         const crc = require('crc-32').buf(Buffer.concat([typeBuf, data])) >>> 0;
         crcBuf.writeUInt32BE(crc, 0);
-      } catch (_) { /* zero CRC fallback — Cloudinary still decodes it */ }
+      } catch (_) { /* zero CRC fallback */ }
       return Buffer.concat([len, typeBuf, data, crcBuf]);
     };
 
