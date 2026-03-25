@@ -1,11 +1,9 @@
-const express  = require('express');
-const router   = express.Router();
+const express = require('express');
+const router = express.Router();
 const Reminder = require('../models/Reminder');
 const { INTERVALS } = require('../models/Reminder');
-const auth     = require('../middleware/auth');
+const auth = require('../middleware/auth');
 const { WhatsAppSession } = require('../models/WhatsAppSession');
-
-// ─── Date helpers ─────────────────────────────────────────────────────────────
 
 function nextReminderDate(intervalDays, reminderTime = '09:00') {
   const [hours, minutes] = (reminderTime || '09:00').split(':').map(Number);
@@ -15,60 +13,150 @@ function nextReminderDate(intervalDays, reminderTime = '09:00') {
   return date;
 }
 
-// Build a Date for same-day delivery at a specific HH:MM
-// If the time has already passed today, schedule for the same time tomorrow
 function sameDayDate(reminderTime = '09:00') {
   const [hours, minutes] = (reminderTime || '09:00').split(':').map(Number);
   const date = new Date();
   date.setHours(hours, minutes, 0, 0);
   if (date <= new Date()) {
-    date.setDate(date.getDate() + 1); // already past — send tomorrow
+    date.setDate(date.getDate() + 1);
   }
   return date;
 }
 
-// ─── POST /api/reminders — create a new reminder ──────────────────────────────
+// Debug endpoint - NO AUTH required
+router.get('/debug-config', async (req, res) => {
+  const config = {
+    timestamp: new Date().toISOString(),
+    email: {
+      EMAIL_USER: process.env.EMAIL_USER ? 'SET' : 'MISSING',
+      EMAIL_PASS: process.env.EMAIL_PASS ? 'SET' : 'MISSING',
+    },
+    twilio: {
+      TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID ? 'SET' : 'MISSING',
+      TWILIO_AUTH_TOKEN: process.env.TWILIO_AUTH_TOKEN ? 'SET' : 'MISSING',
+      TWILIO_WHATSAPP_NUMBER: process.env.TWILIO_WHATSAPP_NUMBER || 'MISSING',
+    },
+  };
 
+  if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+    try {
+      const nodemailer = require('nodemailer');
+      const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+          user: process.env.EMAIL_USER,
+          pass: process.env.EMAIL_PASS,
+        },
+      });
+      await transporter.verify();
+      config.email.status = '✅ WORKING';
+    } catch (err) {
+      config.email.status = `❌ ERROR: ${err.message}`;
+    }
+  }
+
+  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+    try {
+      const twilio = require('twilio');
+      const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+      const account = await client.api.accounts(process.env.TWILIO_ACCOUNT_SID).fetch();
+      config.twilio.status = `✅ WORKING (${account.friendlyName})`;
+    } catch (err) {
+      config.twilio.status = `❌ ERROR: ${err.message}`;
+    }
+  }
+
+  try {
+    const total = await Reminder.countDocuments({});
+    const active = await Reminder.countDocuments({ active: true });
+    const due = await Reminder.countDocuments({ active: true, nextReminder: { $lte: new Date() } });
+    config.reminders = { total, active, dueNow: due };
+  } catch (err) {
+    config.reminders = { error: err.message };
+  }
+
+  res.json(config);
+});
+
+// Test send endpoint
+router.post('/test-send', auth, async (req, res) => {
+  try {
+    const { sendReminder } = require('../services/reminderService');
+    const session = await WhatsAppSession.findOne({ userId: req.user._id, isActive: true });
+
+    const testReminder = {
+      _id: 'TEST',
+      user: req.user._id,
+      subject: 'Test Subject',
+      topic: 'Test Topic - This is a test!',
+      email: req.user.email,
+      phone: session?.phone || '',
+      intervalDays: 1,
+      intervalMinutes: null,
+      reminderTime: '09:00',
+      isOneShot: true,
+      repetitions: 0,
+      sendEmail: true,
+      sendWhatsApp: !!session?.phone,
+    };
+
+    console.log('[TEST] Sending test reminder to:', req.user.email);
+
+    const result = await sendReminder(testReminder);
+
+    res.json({
+      success: true,
+      message: 'Test reminder sent!',
+      sentTo: {
+        email: req.user.email,
+        whatsapp: session?.phone || 'NOT LINKED',
+      },
+      result,
+    });
+  } catch (err) {
+    console.error('[TEST] Error:', err);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
+// Create reminder
 router.post('/', auth, async (req, res) => {
   try {
     const {
       subject, topic, email,
       intervalDays, reminderTime,
-      // New fields
-      scheduleType,   // 'repeating' | 'today' | 'custom_date' | 'interval_minutes'
-      customDate,     // ISO date string for one-shot on a specific date
-      intervalMinutes,// number — for minute-level intervals (e.g. every 30 min)
-      sendWhatsApp,   // bool
-      // WhatsApp phone override (if user hasn't linked their account yet)
-      phone,
+      scheduleType, customDate, intervalMinutes,
+      sendWhatsApp, phone,
     } = req.body;
+
+    console.log('[Reminder] Creating:', { subject, topic, scheduleType, sendWhatsApp });
 
     if (!subject || !topic || !email) {
       return res.status(400).json({ error: 'subject, topic, and email are required' });
     }
 
     const chosenTime = reminderTime || '09:00';
-    let isOneShot    = false;
-    let oneShotAt    = null;
+    let isOneShot = false;
+    let oneShotAt = null;
     let nextReminder;
-    let finalIntervalDays = Math.max(1, parseInt(intervalDays) || 1);
+    let finalIntervalDays = null;
     let finalIntervalMins = null;
 
     switch (scheduleType) {
       case 'today':
-        // Fire once today (or tomorrow if time passed)
-        isOneShot    = true;
-        oneShotAt    = sameDayDate(chosenTime);
+        isOneShot = true;
+        oneShotAt = sameDayDate(chosenTime);
         nextReminder = oneShotAt;
         break;
 
       case 'custom_date':
-        // Fire once at a user-supplied date + time
-        if (!customDate) return res.status(400).json({ error: 'customDate required for custom_date schedule' });
-        isOneShot    = true;
-        oneShotAt    = new Date(customDate);
+        if (!customDate) return res.status(400).json({ error: 'customDate required' });
+        isOneShot = true;
+        oneShotAt = new Date(customDate);
         if (isNaN(oneShotAt.getTime())) return res.status(400).json({ error: 'Invalid customDate' });
-        // Apply the time component from reminderTime if customDate is date-only
         if (!customDate.includes('T')) {
           const [h, m] = chosenTime.split(':').map(Number);
           oneShotAt.setHours(h, m, 0, 0);
@@ -77,22 +165,19 @@ router.post('/', auth, async (req, res) => {
         break;
 
       case 'interval_minutes':
-        // Repeating every N minutes — for very short intervals (e.g. study sprints)
         finalIntervalMins = Math.max(1, parseInt(intervalMinutes) || 60);
         nextReminder = new Date(Date.now() + finalIntervalMins * 60 * 1000);
-        finalIntervalDays = 0; // not day-based
         break;
 
       default:
-        // 'repeating' — standard day-based interval, send first one immediately
+        finalIntervalDays = Math.max(1, parseInt(intervalDays) || 1);
         nextReminder = new Date();
         break;
     }
 
-    // Resolve WhatsApp phone from linked session if not provided
     let resolvedPhone = phone || '';
     if (sendWhatsApp && !resolvedPhone) {
-      const session = await WhatsAppSession.findOne({ userId: req.user._id });
+      const session = await WhatsAppSession.findOne({ userId: req.user._id, isActive: true });
       if (session) resolvedPhone = session.phone;
     }
 
@@ -101,50 +186,47 @@ router.post('/', auth, async (req, res) => {
       subject, topic, email,
       phone: resolvedPhone,
       intervalDays: finalIntervalDays,
+      intervalMinutes: finalIntervalMins,
       reminderTime: chosenTime,
-      isOneShot,
-      oneShotAt,
-      nextReminder,
+      isOneShot, oneShotAt, nextReminder,
       sendEmail: true,
       sendWhatsApp: !!sendWhatsApp,
-      // Store intervalMinutes in a virtual way via a custom field on the doc
-      ...(finalIntervalMins ? { _intervalMinutes: finalIntervalMins } : {}),
     });
 
-    // For minute-based intervals, store it so cron can re-schedule correctly
-    if (finalIntervalMins) {
-      reminder.set('intervalMinutes', finalIntervalMins, { strict: false });
-    }
+    console.log('[Reminder] ✅ Created:', reminder._id);
 
-    // Send the first reminder immediately for repeating reminders
-    if (scheduleType !== 'today' && scheduleType !== 'custom_date') {
+    // Send first reminder immediately for repeating
+    if (scheduleType === 'repeating' || scheduleType === 'interval_minutes' || !scheduleType) {
       try {
         const { sendReminder } = require('../services/reminderService');
+        console.log('[Reminder] Sending first reminder NOW...');
+
         await sendReminder(reminder);
-        reminder.lastSentAt  = new Date();
+
+        reminder.lastSentAt = new Date();
         reminder.repetitions = 1;
-        // Schedule next
+
         if (finalIntervalMins) {
           reminder.nextReminder = new Date(Date.now() + finalIntervalMins * 60 * 1000);
         } else {
           reminder.nextReminder = nextReminderDate(finalIntervalDays, chosenTime);
         }
+
         await reminder.save();
-      } catch (mailErr) {
-        console.error('[Reminder] First-send failed:', mailErr.message);
+        console.log('[Reminder] ✅ First sent, next at:', reminder.nextReminder);
+
+      } catch (err) {
+        console.error('[Reminder] ❌ First send failed:', err.message);
       }
-    } else {
-      await reminder.save();
     }
 
     res.status(201).json({ success: true, reminder });
+
   } catch (err) {
-    console.error('[reminders] POST error:', err.message);
+    console.error('[Reminder] POST error:', err);
     res.status(500).json({ error: err.message });
   }
 });
-
-// ─── GET /api/reminders ───────────────────────────────────────────────────────
 
 router.get('/', auth, async (req, res) => {
   try {
@@ -154,8 +236,6 @@ router.get('/', auth, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-// ─── DELETE /api/reminders/:id ────────────────────────────────────────────────
 
 router.delete('/:id', auth, async (req, res) => {
   try {
@@ -169,18 +249,13 @@ router.delete('/:id', auth, async (req, res) => {
   }
 });
 
-// ─── GET /api/reminders/intervals ────────────────────────────────────────────
-
 router.get('/intervals', auth, (_req, res) => {
-  res.json({ intervals: INTERVALS, description: 'Days between each repetition' });
+  res.json({ intervals: INTERVALS });
 });
-
-// ─── GET /api/reminders/whatsapp-phone ───────────────────────────────────────
-// Returns the linked WhatsApp phone for the current user (to pre-fill UI)
 
 router.get('/whatsapp-phone', auth, async (req, res) => {
   try {
-    const session = await WhatsAppSession.findOne({ userId: req.user._id });
+    const session = await WhatsAppSession.findOne({ userId: req.user._id, isActive: true });
     res.json({
       linked: !!session,
       phone: session?.phone ? session.phone.replace('whatsapp:', '') : null,
