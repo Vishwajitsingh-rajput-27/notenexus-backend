@@ -24,8 +24,9 @@ const tutorRoutes    = require('./routes/tutor');
 const { startReminderCron } = require('./services/reminderService');
 
 
-const searchRoutes   = require('./routes/search');
-const revisionRoutes = require('./routes/revision');
+const searchRoutes     = require('./routes/search');
+const revisionRoutes   = require('./routes/revision');
+const savedItemsRoutes = require('./routes/savedItems');
 
 const app    = express();
 const server = http.createServer(app);
@@ -65,6 +66,7 @@ app.use('/api/reminders', reminderRoutes);
 app.use('/api/tutor',     tutorRoutes);
 app.use('/api/search',   searchRoutes);
 app.use('/api/revision', revisionRoutes);
+app.use('/api/saved',    savedItemsRoutes);
 
 app.get('/', (req, res) => res.json({ 
   message: 'NoteNexus API running! 📚', 
