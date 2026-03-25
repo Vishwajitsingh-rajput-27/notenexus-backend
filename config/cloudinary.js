@@ -8,19 +8,22 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// PDFs must use resource_type 'raw', images/audio use 'auto'
+// PDFs MUST use resource_type 'image' (not 'raw') so that Cloudinary's
+// pg_N page-render transformation works for OCR on scanned PDFs.
+// Audio/other files use 'auto'.
 const storage = new CloudinaryStorage({
   cloudinary,
   params: async (req, file) => {
-    const isPDF = file.mimetype === 'application/pdf';
+    const isPDF   = file.mimetype === 'application/pdf';
+    const isAudio = ['audio/mpeg', 'audio/wav', 'audio/x-m4a', 'audio/webm'].includes(file.mimetype);
     return {
-      folder: 'notenexus',
-      resource_type: isPDF ? 'raw' : 'auto',
+      folder:        'notenexus',
+      resource_type: isAudio ? 'video' : 'image',   // PDFs → 'image', audio → 'video', rest → 'image'
       allowed_formats: ['pdf', 'jpg', 'jpeg', 'png', 'webp', 'mp3', 'wav', 'm4a', 'webm'],
     };
   },
 });
 
-const upload = multer({ storage, limits: { fileSize: 25 * 1024 * 1024 } }); // 25MB
+const upload = multer({ storage, limits: { fileSize: 25 * 1024 * 1024 } }); // 25 MB
 
 module.exports = { cloudinary, upload };
