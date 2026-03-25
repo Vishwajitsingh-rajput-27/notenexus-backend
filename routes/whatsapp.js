@@ -94,30 +94,109 @@ function formatSavedList(items) {
 }
 
 function formatNoteDetail(note) {
-  const preview = note.content ? note.content.slice(0, 600) : '(no content extracted)';
-  return `📄 *${note.title}*\nSubject: ${note.subject} | ${note.chapter}\nKeywords: ${(note.keywords || []).join(', ') || 'none'}\n\n${preview}${note.content?.length > 600 ? '...' : ''}`;
+  const sourceIcon = { pdf: '📄', image: '🖼️', youtube: '🎥', voice: '🎙️', whatsapp: '💬', text: '📝' };
+  const icon = sourceIcon[note.sourceType] || '📄';
+
+  let lines = [];
+  lines.push(`${icon} *${note.title}*`);
+  lines.push(`📚 Subject: ${note.subject} | ${note.chapter}`);
+  if (note.sourceType === 'youtube' && note.fileUrl) lines.push(`🔗 YouTube: ${note.fileUrl}`);
+  if (['pdf','image','voice'].includes(note.sourceType) && note.fileUrl) lines.push(`🔗 File: ${note.fileUrl}`);
+  if (note.keywords?.length) lines.push(`🏷️ Keywords: ${note.keywords.join(', ')}`);
+  lines.push('');
+  if (note.content) {
+    lines.push(note.content.slice(0, 800));
+    if (note.content.length > 800) lines.push('\n_(content truncated — open app to read full note)_');
+  } else {
+    lines.push('_(no text content extracted)_');
+  }
+  return lines.join('\n');
 }
 
 function formatSavedDetail(item) {
   const emoji = { mindmap: '🗺️', flashcards: '🃏', chat: '💬', studyplan: '📅', examquestions: '📝', quiz: '❓' };
-  const icon  = emoji[item.type] || '📌';
-  let content = '';
+  const icon = emoji[item.type] || '📌';
+  let lines = [];
+  lines.push(`${icon} *${item.name}*`);
+  if (item.subject) lines.push(`📚 Subject: ${item.subject}`);
+  lines.push('');
 
   if (item.type === 'flashcards' && Array.isArray(item.data)) {
-    content = item.data.slice(0, 5).map((f, i) => `Q${i+1}: ${f.question}\nA${i+1}: ${f.answer}`).join('\n\n');
-    if (item.data.length > 5) content += `\n\n...and ${item.data.length - 5} more cards.`;
-  } else if (item.type === 'studyplan' && item.data?.plan) {
-    content = typeof item.data.plan === 'string' ? item.data.plan.slice(0, 600) : JSON.stringify(item.data.plan).slice(0, 600);
-  } else if (item.type === 'examquestions' && Array.isArray(item.data)) {
-    content = item.data.slice(0, 5).map((q, i) => `Q${i+1}: ${typeof q === 'string' ? q : q.question || JSON.stringify(q)}`).join('\n\n');
+    const cards = item.data;
+    lines.push(`🃏 *${cards.length} Flashcards:*\n`);
+    cards.forEach((f, i) => {
+      lines.push(`*Q${i+1}:* ${f.question}`);
+      lines.push(`*A${i+1}:* ${f.answer}\n`);
+    });
+
+  } else if (item.type === 'examquestions') {
+    // data can be array of question objects or { questions: [...] }
+    const raw = Array.isArray(item.data) ? item.data : (item.data?.questions || []);
+    lines.push(`📝 *${raw.length} Exam Questions:*\n`);
+    raw.forEach((q, i) => {
+      const qText = typeof q === 'string' ? q : (q.question || q.text || '');
+      const qType = q.type ? ` _(${q.type})_` : '';
+      const diff  = q.difficulty ? ` [${q.difficulty}]` : '';
+      lines.push(`*Q${i+1}:*${diff}${qType} ${qText}`);
+      if (Array.isArray(q.options)) {
+        q.options.forEach(opt => lines.push(`   ${opt}`));
+      }
+      if (q.answer) lines.push(`✅ *Answer:* ${q.answer}`);
+      lines.push('');
+    });
+
+  } else if (item.type === 'studyplan') {
+    const plan = item.data?.plan || item.data;
+    if (typeof plan === 'string') {
+      lines.push(plan.slice(0, 1200));
+    } else if (Array.isArray(plan)) {
+      plan.forEach(day => {
+        lines.push(`📅 *Day ${day.day}* — ${day.date || ''}`);
+        if (Array.isArray(day.sessions)) {
+          day.sessions.forEach(s => lines.push(`  • ${s.subject}: ${s.topic} (${s.duration} min)`));
+        }
+        lines.push('');
+      });
+    } else {
+      lines.push(JSON.stringify(plan).slice(0, 800));
+    }
+
   } else if (item.type === 'mindmap') {
-    content = item.data?.summary || item.data?.title || 'Mind map saved — view it on the app.';
-  } else {
-    const raw = JSON.stringify(item.data);
-    content = raw.slice(0, 600) + (raw.length > 600 ? '...' : '');
+    const title   = item.data?.title || item.data?.topic || item.name;
+    const summary = item.data?.summary || '';
+    const nodes   = item.data?.nodes || item.data?.branches || [];
+    lines.push(`🗺️ *${title}*`);
+    if (summary) lines.push(`\n${summary}`);
+    if (Array.isArray(nodes) && nodes.length) {
+      lines.push('\n*Key branches:*');
+      nodes.slice(0, 10).forEach(n => {
+        const label = typeof n === 'string' ? n : (n.label || n.text || n.name || '');
+        if (label) lines.push(`  • ${label}`);
+      });
+    }
+    lines.push('\n_(Full mind map visible in the app)_');
+
+  } else if (item.type === 'quiz' && Array.isArray(item.data)) {
+    lines.push(`❓ *${item.data.length} Quiz Questions:*\n`);
+    item.data.forEach((q, i) => {
+      lines.push(`*Q${i+1}:* ${q.question || q}`);
+      if (Array.isArray(q.options)) q.options.forEach(o => lines.push(`   ${o}`));
+      if (q.answer) lines.push(`✅ *Answer:* ${q.answer}`);
+      lines.push('');
+    });
+
+  } else if (item.type === 'chat') {
+    const msgs = Array.isArray(item.data) ? item.data : (item.data?.messages || []);
+    lines.push(`💬 *${msgs.length} messages saved*\n`);
+    msgs.slice(0, 8).forEach(m => {
+      const role = m.role === 'user' ? '🧑' : '🤖';
+      const text = (m.content || m.text || '').slice(0, 200);
+      lines.push(`${role} ${text}\n`);
+    });
+    if (msgs.length > 8) lines.push(`_(${msgs.length - 8} more messages — open app to read)_`);
   }
 
-  return `${icon} *${item.name}* [${item.type}]\n${item.subject ? 'Subject: ' + item.subject + '\n' : ''}\n${content}`;
+  return lines.join('\n').slice(0, 1550);
 }
 
 // ─── Numbered item selection (in-memory cache) ────────────────────────────────
