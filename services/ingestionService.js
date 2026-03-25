@@ -26,7 +26,24 @@ const fetchBuffer = (urlStr) =>
     try {
       const parsed  = new URL(urlStr);
       const lib     = parsed.protocol === 'https:' ? https : http;
-      const request = lib.get(urlStr, (res) => {
+
+      // ADDED: Include Cloudinary auth if fetching from our own Cloudinary account
+      const headers = {};
+      if (parsed.hostname.includes('cloudinary.com')) {
+        const config = cloudinary.config();
+        if (config.api_key && config.api_secret) {
+          const auth = Buffer.from(`${config.api_key}:${config.api_secret}`).toString('base64');
+          headers['Authorization'] = `Basic ${auth}`;
+        }
+      }
+
+      const options = {
+        hostname: parsed.hostname,
+        path:     parsed.pathname + parsed.search,
+        headers,
+      };
+
+      const request = lib.get(options, (res) => {
         if (res.statusCode === 301 || res.statusCode === 302) {
           return fetchBuffer(res.headers.location).then(resolve).catch(reject);
         }
