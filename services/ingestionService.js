@@ -201,11 +201,76 @@ const groqWhisper = (audioBuffer, filename) =>
     form.pipe(req);
   });
 
+// ── Send entire PDF as base64 directly to Groq Vision (no canvas needed) ─────
+// Used as fallback when canvas is unavailable (most cloud environments).
+const groqVisionPDF = (pdfBase64, prompt) =>
+  new Promise((resolve, reject) => {
+    const model = process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
+
+    const body = JSON.stringify({
+      model,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'image_url',
+            image_url: { url: `data:application/pdf;base64,${pdfBase64}` }
+          },
+          { type: 'text', text: prompt }
+        ]
+      }],
+      max_tokens: 4096,
+      temperature: 0.1
+    });
+
+    const options = {
+      hostname: 'api.groq.com',
+      path: '/openai/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        try {
+          const raw    = Buffer.concat(chunks).toString('utf8');
+          const parsed = JSON.parse(raw);
+          if (parsed.error) {
+            const msg = parsed.error.message || JSON.stringify(parsed.error);
+            return reject(new Error(`Groq PDF Vision error (HTTP ${res.statusCode}): ${msg}`));
+          }
+          if (res.statusCode !== 200) {
+            return reject(new Error(`Groq PDF Vision HTTP ${res.statusCode}: ${raw.slice(0, 300)}`));
+          }
+          resolve(parsed.choices?.[0]?.message?.content?.trim() || '');
+        } catch (e) {
+          reject(new Error(`Failed to parse Groq PDF Vision response: ${e.message}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(120000, () => {
+      req.destroy();
+      reject(new Error('Groq PDF Vision timeout (120 s)'));
+    });
+    req.write(body);
+    req.end();
+  });
+
 // ── Extract text from PDF ─────────────────────────────────────────────────────
 // Step 1: pdf-parse for text-based PDFs (instant).
-// Step 2: pdfjs-dist + canvas renders each page as JPEG locally, then:
-//   2a. Groq Vision OCR (fast, high quality).
-//   2b. If Groq Vision fails or returns empty → tesseract.js (reliable fallback).
+// Step 2: Try pdfjs-dist + canvas to render each page as JPEG for OCR.
+//   2a. Groq Vision OCR on rendered JPEG (fast, high quality).
+//   2b. tesseract.js fallback if Groq Vision fails.
+// Step 3 (NEW): If canvas is not available in the environment, send the whole
+//   PDF as base64 directly to Groq Vision — works on all cloud hosts without
+//   any native binary dependencies (fixes "Image or Canvas expected" error).
 const extractFromPDF = async (pdfUrl) => {
   // ── Step 1: embedded text ─────────────────────────────────────────────────
   const buffer = await fetchBuffer(pdfUrl);
@@ -217,92 +282,121 @@ const extractFromPDF = async (pdfUrl) => {
     return text;
   }
 
-  // ── Step 2: render pages locally and OCR ─────────────────────────────────
-  console.log('[extractFromPDF] No embedded text — rendering pages locally for OCR...');
+  // ── Step 2: try canvas-based page rendering + OCR ─────────────────────────
+  console.log('[extractFromPDF] No embedded text — attempting canvas-based OCR...');
 
-  let pdfjsLib;
+  let canvasAvailable = false;
+  let createCanvas;
   try {
-    pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
-  } catch {
-    pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    ({ createCanvas } = require('canvas'));
+    // Quick sanity-check: actually create a tiny canvas to confirm native
+    // bindings are working (just requiring the module is not enough).
+    const testCanvas = createCanvas(4, 4);
+    testCanvas.getContext('2d');
+    canvasAvailable = true;
+    console.log('[extractFromPDF] canvas module is available — using page-render OCR.');
+  } catch (canvasErr) {
+    console.warn(`[extractFromPDF] canvas not available (${canvasErr.message}) — will use direct PDF Vision fallback.`);
   }
 
-  const { createCanvas } = require('canvas');
-
-  const uint8Array = new Uint8Array(buffer);
-  const pdfDoc     = await pdfjsLib.getDocument({
-    data:            uint8Array,
-    useSystemFonts:  true,
-    disableFontFace: true,
-  }).promise;
-
-  const pageCount = Math.min(pdfDoc.numPages, 20);
-  console.log(`[extractFromPDF] ${pdfDoc.numPages} page(s) in PDF — processing ${pageCount}.`);
-
-  const pageTexts      = [];
-  let   firstPageError = null;   // FIX: track the real failure reason
-
-  for (let pg = 1; pg <= pageCount; pg++) {
+  if (canvasAvailable) {
+    // ── Canvas path (original logic) ────────────────────────────────────────
+    let pdfjsLib;
     try {
-      const page     = await pdfDoc.getPage(pg);
-      const viewport = page.getViewport({ scale: 2.0 });
-
-      const canvas  = createCanvas(viewport.width, viewport.height);
-      const context = canvas.getContext('2d');
-
-      await page.render({ canvasContext: context, viewport }).promise;
-
-      const jpegBuffer = canvas.toBuffer('image/jpeg', { quality: 0.92 });
-      const base64     = jpegBuffer.toString('base64');
-
-      console.log(`[extractFromPDF] Page ${pg}/${pageCount} rendered (${jpegBuffer.length} bytes) — OCR in progress...`);
-
-      // ── 2a. Try Groq Vision ───────────────────────────────────────────────
-      let pageText = '';
-      try {
-        pageText = await groqVision(
-          base64,
-          'image/jpeg',
-          'Extract ALL text from this page image. Preserve layout and formatting. Return only the text, nothing else.'
-        );
-      } catch (groqErr) {
-        // FIX: record the real error so we can surface it if everything fails
-        if (!firstPageError) firstPageError = groqErr;
-        console.warn(`[extractFromPDF] Page ${pg} Groq Vision failed: ${groqErr.message}`);
-      }
-
-      // ── 2b. Fallback to tesseract.js if Groq returned nothing ─────────────
-      if (!pageText || pageText.trim().length === 0) {
-        console.log(`[extractFromPDF] Page ${pg} — trying tesseract.js fallback...`);
-        pageText = await tesseractOCR(jpegBuffer);
-        if (pageText && pageText.trim().length > 0) {
-          console.log(`[extractFromPDF] Page ${pg} tesseract succeeded (${pageText.trim().length} chars).`);
-        } else {
-          console.warn(`[extractFromPDF] Page ${pg} — both Groq Vision and tesseract returned empty.`);
-        }
-      }
-
-      if (pageText && pageText.trim().length > 0) {
-        pageTexts.push(`--- Page ${pg} ---\n${pageText.trim()}`);
-        console.log(`[extractFromPDF] Page ${pg} done (${pageText.trim().length} chars).`);
-      }
-
-      page.cleanup();
-    } catch (err) {
-      if (!firstPageError) firstPageError = err;
-      console.warn(`[extractFromPDF] Page ${pg} failed:`, err.message);
+      pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+    } catch {
+      pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
     }
+
+    const uint8Array = new Uint8Array(buffer);
+    const pdfDoc     = await pdfjsLib.getDocument({
+      data:            uint8Array,
+      useSystemFonts:  true,
+      disableFontFace: true,
+    }).promise;
+
+    const pageCount = Math.min(pdfDoc.numPages, 20);
+    console.log(`[extractFromPDF] ${pdfDoc.numPages} page(s) — processing ${pageCount}.`);
+
+    const pageTexts      = [];
+    let   firstPageError = null;
+
+    for (let pg = 1; pg <= pageCount; pg++) {
+      try {
+        const page     = await pdfDoc.getPage(pg);
+        const viewport = page.getViewport({ scale: 2.0 });
+
+        const canvas  = createCanvas(viewport.width, viewport.height);
+        const context = canvas.getContext('2d');
+
+        await page.render({ canvasContext: context, viewport }).promise;
+
+        const jpegBuffer = canvas.toBuffer('image/jpeg', { quality: 0.92 });
+        const base64     = jpegBuffer.toString('base64');
+
+        console.log(`[extractFromPDF] Page ${pg}/${pageCount} rendered (${jpegBuffer.length} bytes) — OCR...`);
+
+        let pageText = '';
+        try {
+          pageText = await groqVision(
+            base64,
+            'image/jpeg',
+            'Extract ALL text from this page image. Preserve layout and formatting. Return only the text, nothing else.'
+          );
+        } catch (groqErr) {
+          if (!firstPageError) firstPageError = groqErr;
+          console.warn(`[extractFromPDF] Page ${pg} Groq Vision failed: ${groqErr.message}`);
+        }
+
+        if (!pageText || pageText.trim().length === 0) {
+          console.log(`[extractFromPDF] Page ${pg} — trying tesseract fallback...`);
+          pageText = await tesseractOCR(jpegBuffer);
+        }
+
+        if (pageText && pageText.trim().length > 0) {
+          pageTexts.push(`--- Page ${pg} ---\n${pageText.trim()}`);
+          console.log(`[extractFromPDF] Page ${pg} done (${pageText.trim().length} chars).`);
+        }
+
+        page.cleanup();
+      } catch (err) {
+        if (!firstPageError) firstPageError = err;
+        console.warn(`[extractFromPDF] Page ${pg} failed:`, err.message);
+      }
+    }
+
+    if (pageTexts.length > 0) return pageTexts.join('\n\n');
+
+    // Canvas path produced nothing — fall through to direct PDF Vision below
+    console.warn('[extractFromPDF] Canvas-based OCR produced no text — trying direct PDF Vision...');
   }
 
-  if (pageTexts.length === 0) {
-    // FIX: include the real reason so developers know exactly what to fix
-    const detail = firstPageError
-      ? ` — ${firstPageError.message}`
-      : ' — vision OCR returned nothing';
-    throw new Error(`Could not extract text from source${detail}`);
+  // ── Step 3: No canvas / canvas path failed — send PDF directly to Groq Vision
+  // This works on Render, Railway, Vercel, and any host without native canvas.
+  console.log('[extractFromPDF] Using direct PDF → Groq Vision fallback...');
+  try {
+    const pdfBase64 = buffer.toString('base64');
+    const result = await groqVisionPDF(
+      pdfBase64,
+      'Extract ALL text from this PDF document. Preserve the layout and formatting as much as possible. Return only the extracted text, nothing else.'
+    );
+    if (result && result.trim().length > 0) {
+      console.log(`[extractFromPDF] Direct PDF Vision succeeded (${result.trim().length} chars).`);
+      return result.trim();
+    }
+  } catch (visionErr) {
+    console.warn(`[extractFromPDF] Direct PDF Vision failed: ${visionErr.message}`);
   }
 
-  return pageTexts.join('\n\n');
+  // ── Final fallback: tesseract on raw buffer ────────────────────────────────
+  console.log('[extractFromPDF] Trying tesseract on raw PDF buffer as last resort...');
+  const tessResult = await tesseractOCR(buffer);
+  if (tessResult && tessResult.trim().length > 0) {
+    console.log(`[extractFromPDF] Tesseract fallback succeeded (${tessResult.trim().length} chars).`);
+    return tessResult.trim();
+  }
+
+  throw new Error('Could not extract text from source — all extraction methods failed. The PDF may be encrypted or contain no readable content.');
 };
 
 // ── Extract text from image ───────────────────────────────────────────────────
