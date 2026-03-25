@@ -137,11 +137,24 @@ async function handleIncomingPDF(session, mediaUrl, mediaContentType, from) {
     const fetchBuffer = (urlStr) => new Promise((resolve, reject) => {
       const parsed = new URL(urlStr);
       const lib = parsed.protocol === 'https:' ? https : http;
+      
+      const headers = {};
       // Twilio media URLs require auth
-      const authHeader = 'Basic ' + Buffer.from(
-        `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
-      ).toString('base64');
-      const options = { hostname: parsed.hostname, path: parsed.pathname + parsed.search, headers: { Authorization: authHeader } };
+      if (parsed.hostname.includes('twilio.com')) {
+        headers['Authorization'] = 'Basic ' + Buffer.from(
+          `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
+        ).toString('base64');
+      }
+      // ADDED: Include Cloudinary auth if fetching from our own Cloudinary account
+      else if (parsed.hostname.includes('cloudinary.com')) {
+        const config = cloudinary.config();
+        if (config.api_key && config.api_secret) {
+          const auth = Buffer.from(`${config.api_key}:${config.api_secret}`).toString('base64');
+          headers['Authorization'] = `Basic ${auth}`;
+        }
+      }
+
+      const options = { hostname: parsed.hostname, path: parsed.pathname + parsed.search, headers };
       const req = lib.get(options, (res) => {
         const chunks = [];
         res.on('data', c => chunks.push(c));
