@@ -1,22 +1,24 @@
 /**
  * ingestionService.js  —  NoteNexus
  *
- * NEW in this version:
- *   • extractImagesFromPDF(pdfUrl)  — extracts embedded images + renders each
- *     page as an image via the Cloudinary pg_N URL trick, returning an array
- *     of Cloudinary image URLs ready to store in Note.extractedImages[].
+ * PDF OCR strategy (no Cloudinary pg_N dependency for old raw uploads):
  *
- *   • extractFromPDF updated to fall back to full multi-page vision OCR
- *     when pdf-parse finds no embedded text (scanned/image-based PDFs).
- *
- * Existing functions are otherwise unchanged.
+ *  1. pdf-parse  → fast embedded-text extraction (text-based PDFs)
+ *  2. If <50 chars returned, PDF is image-based (scanned).
+ *     → Determine a valid Cloudinary *image* URL for pg_N rendering:
+ *         a) New uploads: resource_type='image' → URL already has /image/upload/
+ *         b) Old uploads: resource_type='raw'   → URL has /raw/upload/
+ *            Re-upload buffer once as resource_type='image', use that URL.
+ *         c) Non-Cloudinary URL: same re-upload path as (b).
+ *     → Render each page as JPEG via pg_N, fetch it, send to Groq Vision OCR.
+ *     → Concatenate all pages, return full text.
  */
 
-const pdfParse  = require('pdf-parse');
-const https     = require('https');
-const http      = require('http');
-const { URL }   = require('url');
-const FormData  = require('form-data');
+const pdfParse   = require('pdf-parse');
+const https      = require('https');
+const http       = require('http');
+const { URL }    = require('url');
+const FormData   = require('form-data');
 const cloudinary = require('../config/cloudinary').cloudinary;
 
 // ── Fetch file buffer from any URL ────────────────────────────────────────────
@@ -24,13 +26,13 @@ const fetchBuffer = (urlStr) =>
   new Promise((resolve, reject) => {
     try {
       const parsed = new URL(urlStr);
-      const lib = parsed.protocol === 'https:' ? https : http;
+      const lib    = parsed.protocol === 'https:' ? https : http;
       const request = lib.get(urlStr, (res) => {
         if (res.statusCode === 301 || res.statusCode === 302) {
           return fetchBuffer(res.headers.location).then(resolve).catch(reject);
         }
         if (res.statusCode !== 200) {
-          return reject(new Error(`HTTP ${res.statusCode} fetching file`));
+          return reject(new Error(`HTTP ${res.statusCode} fetching ${urlStr}`));
         }
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
@@ -48,6 +50,40 @@ const fetchBuffer = (urlStr) =>
       });
     } catch (e) { reject(e); }
   });
+
+// ── Upload a buffer to Cloudinary as resource_type='image' ───────────────────
+// Returns the secure_url of the uploaded asset.
+const uploadBufferAsImage = (buffer, folder = 'notenexus/pdfs') =>
+  new Promise((resolve, reject) => {
+    const { Readable } = require('stream');
+    const stream = cloudinary.uploader.upload_stream(
+      { resource_type: 'image', format: 'pdf', folder },
+      (err, result) => { if (err) reject(err); else resolve(result.secure_url); }
+    );
+    Readable.from(buffer).pipe(stream);
+  });
+
+// ── Derive a Cloudinary *image* base URL suitable for pg_N ───────────────────
+// Handles three cases:
+//   1. Already an image URL  (/image/upload/)  → use as-is
+//   2. Raw URL               (/raw/upload/)    → re-upload buffer as image
+//   3. Non-Cloudinary URL                      → re-upload buffer as image
+const getCloudinaryImageUrl = async (pdfUrl, buffer) => {
+  if (pdfUrl.includes('res.cloudinary.com')) {
+    if (pdfUrl.includes('/image/upload/')) {
+      // New-style upload — pg_N ready
+      return pdfUrl;
+    }
+    if (pdfUrl.includes('/raw/upload/')) {
+      // Old-style upload — re-upload once as image type
+      console.log('[getCloudinaryImageUrl] Detected raw URL — re-uploading as image type...');
+      return uploadBufferAsImage(buffer);
+    }
+  }
+  // Non-Cloudinary URL
+  console.log('[getCloudinaryImageUrl] Non-Cloudinary URL — uploading buffer...');
+  return uploadBufferAsImage(buffer);
+};
 
 // ── Groq Vision API ───────────────────────────────────────────────────────────
 const groqVision = (base64Data, mimeType, prompt) =>
@@ -101,7 +137,7 @@ const groqWhisper = (audioBuffer, filename) =>
   new Promise((resolve, reject) => {
     const form = new FormData();
     form.append('file', audioBuffer, {
-      filename: filename || 'audio.mp3',
+      filename:    filename || 'audio.mp3',
       contentType: 'audio/mpeg'
     });
     form.append('model', 'whisper-large-v3');
@@ -139,60 +175,48 @@ const groqWhisper = (audioBuffer, filename) =>
   });
 
 // ── Extract text from PDF ─────────────────────────────────────────────────────
-// Tries pdf-parse first (fast, free). If the PDF is image-based / scanned and
-// yields fewer than 50 chars, falls back to Groq Vision OCR on every page.
 const extractFromPDF = async (pdfUrl) => {
-  // Step 1: attempt embedded-text extraction
+  // ── Step 1: try embedded text (instant, free) ─────────────────────────────
   const buffer = await fetchBuffer(pdfUrl);
   const data   = await pdfParse(buffer);
   const text   = (data.text || '').trim();
 
-  if (text.length > 50) return text; // real embedded text found — done
-
-  // Step 2: PDF is image-based (scanned/photographed) — OCR every page
-  console.log('[extractFromPDF] No embedded text — falling back to vision OCR for all pages...');
-
-  const pageCount = Math.min(data.numpages || 1, 20); // cap at 20 pages
-  let cloudinaryBaseUrl;
-
-  if (pdfUrl.includes('res.cloudinary.com')) {
-    // Already on Cloudinary — use as-is, inject pg_N per iteration
-    cloudinaryBaseUrl = pdfUrl;
-  } else {
-    // Upload the buffer once so we can use Cloudinary's pg_N rendering
-    const uploadResult = await new Promise((resolve, reject) => {
-      const { Readable } = require('stream');
-      const stream = cloudinary.uploader.upload_stream(
-        { resource_type: 'raw', format: 'pdf', folder: 'notenexus/pdfs' },
-        (err, res) => { if (err) reject(err); else resolve(res); }
-      );
-      Readable.from(buffer).pipe(stream);
-    });
-    cloudinaryBaseUrl = uploadResult.secure_url;
+  if (text.length > 50) {
+    console.log(`[extractFromPDF] Embedded text found (${text.length} chars).`);
+    return text;
   }
+
+  // ── Step 2: scanned/image PDF — OCR every page via Groq Vision ────────────
+  console.log('[extractFromPDF] No embedded text — starting vision OCR...');
+
+  const pageCount       = Math.min(data.numpages || 1, 20);
+  const cloudinaryImgUrl = await getCloudinaryImageUrl(pdfUrl, buffer);
+
+  console.log(`[extractFromPDF] Using image base URL: ${cloudinaryImgUrl}`);
+  console.log(`[extractFromPDF] Pages to OCR: ${pageCount}`);
 
   const pageTexts = [];
 
   for (let pg = 1; pg <= pageCount; pg++) {
     try {
-      const imageUrl = cloudinaryBaseUrl.replace(
+      // Build the pg_N transformation URL
+      const imageUrl = cloudinaryImgUrl.replace(
         '/upload/',
         `/upload/pg_${pg},f_jpg,w_1400,q_90/`
       );
 
+      console.log(`[extractFromPDF] Fetching page ${pg}: ${imageUrl}`);
       const imgBuffer = await fetchBuffer(imageUrl);
+      console.log(`[extractFromPDF] Page ${pg} image size: ${imgBuffer.length} bytes`);
 
-      // Cloudinary returns a tiny placeholder for out-of-range page numbers —
-      // treat anything under 5 KB as "no more pages" and stop early.
+      // Cloudinary returns a small error image for out-of-range pages
       if (imgBuffer.length < 5000) {
-        console.log(`[extractFromPDF] Page ${pg} is empty or out of range — stopping early.`);
+        console.log(`[extractFromPDF] Page ${pg} too small (${imgBuffer.length}B) — stopping early.`);
         break;
       }
 
-      const base64 = imgBuffer.toString('base64');
-      console.log(`[extractFromPDF] OCR page ${pg}/${pageCount}...`);
-
-      const pageText = await groqVision(
+      const base64    = imgBuffer.toString('base64');
+      const pageText  = await groqVision(
         base64,
         'image/jpeg',
         'Extract ALL text from this page image. Preserve layout and formatting. Return only the text, nothing else.'
@@ -200,10 +224,13 @@ const extractFromPDF = async (pdfUrl) => {
 
       if (pageText && pageText.trim().length > 0) {
         pageTexts.push(`--- Page ${pg} ---\n${pageText.trim()}`);
+        console.log(`[extractFromPDF] Page ${pg} OCR complete (${pageText.trim().length} chars).`);
+      } else {
+        console.warn(`[extractFromPDF] Page ${pg} returned empty OCR result.`);
       }
     } catch (err) {
-      // Log and continue — one bad page shouldn't abort the whole document
       console.warn(`[extractFromPDF] OCR failed for page ${pg}:`, err.message);
+      // Continue — one bad page must not abort the whole document
     }
   }
 
@@ -218,7 +245,7 @@ const extractFromPDF = async (pdfUrl) => {
 const extractFromImage = async (imageUrl) => {
   const buffer = await fetchBuffer(imageUrl);
   const base64 = buffer.toString('base64');
-  const ext    = imageUrl.split('.').pop().toLowerCase();
+  const ext    = imageUrl.split('.').pop().toLowerCase().split('?')[0];
   const mime   = ext === 'png' ? 'image/png' : 'image/jpeg';
   return groqVision(
     base64,
@@ -235,20 +262,35 @@ const extractFromVoice = async (audioUrl) => {
 
 // ── Extract from YouTube ──────────────────────────────────────────────────────
 const extractFromYouTube = async (youtubeUrl) => {
-  throw new Error('YouTube extraction not changed in this diff — keep your original implementation');
+  const { YoutubeTranscript } = require('youtube-transcript');
+
+  // Extract video ID from various YouTube URL formats
+  const idMatch = youtubeUrl.match(
+    /(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/
+  );
+  if (!idMatch) throw new Error('Invalid YouTube URL');
+
+  const videoId = idMatch[1];
+  const transcript = await YoutubeTranscript.fetchTranscript(videoId);
+
+  if (!transcript || transcript.length === 0) {
+    throw new Error('No transcript available for this YouTube video');
+  }
+
+  return transcript.map((item) => item.text).join(' ');
 };
 
 // ────────────────────────────────────────────────────────────────────────────
-// ★ extractImagesFromPDF
+// extractImagesFromPDF
 //
-//  A) Cloudinary "pg_N" page renders  — one JPEG URL per page, no extra deps
-//  B) pdfjs-dist embedded image extraction — raw raster images inside the PDF
+//  A) Cloudinary pg_N page renders — one JPEG URL per page
+//  B) pdfjs-dist embedded image extraction — raw images inside the PDF
 //
 //  Returns: { pageImages: string[], embeddedImages: string[] }
 // ────────────────────────────────────────────────────────────────────────────
 const extractImagesFromPDF = async (pdfUrl, options = {}) => {
   const {
-    maxPages       = 20,
+    maxPages        = 20,
     extractEmbedded = true,
   } = options;
 
@@ -257,43 +299,21 @@ const extractImagesFromPDF = async (pdfUrl, options = {}) => {
     embeddedImages: [],
   };
 
-  // ── A) Page renders via Cloudinary transformation ─────────────────────────
+  // ── A) Page renders ────────────────────────────────────────────────────────
   try {
-    if (pdfUrl.includes('res.cloudinary.com')) {
-      const buffer    = await fetchBuffer(pdfUrl);
-      const parsed    = await pdfParse(buffer);
-      const pageCount = Math.min(parsed.numpages || 1, maxPages);
+    const buffer          = await fetchBuffer(pdfUrl);
+    const parsed          = await pdfParse(buffer);
+    const pageCount       = Math.min(parsed.numpages || 1, maxPages);
+    const cloudinaryImgUrl = await getCloudinaryImageUrl(pdfUrl, buffer);
 
-      for (let pg = 1; pg <= pageCount; pg++) {
-        const pageUrl = pdfUrl.replace(
-          '/upload/',
-          `/upload/pg_${pg},f_jpg,w_1200,q_85/`
-        );
-        results.pageImages.push(pageUrl);
-      }
-      console.log(`[extractImagesFromPDF] ${pageCount} page image URLs generated via Cloudinary.`);
-    } else {
-      const buffer    = await fetchBuffer(pdfUrl);
-      const parsed    = await pdfParse(buffer);
-      const pageCount = Math.min(parsed.numpages || 1, maxPages);
-
-      for (let pg = 1; pg <= pageCount; pg++) {
-        const uploadResult = await new Promise((resolve, reject) => {
-          const { Readable } = require('stream');
-          const stream = cloudinary.uploader.upload_stream(
-            {
-              resource_type: 'image',
-              format: 'jpg',
-              transformation: [{ page: pg, width: 1200, quality: 85 }],
-              folder: 'notenexus/pdf-pages',
-            },
-            (err, result) => { if (err) reject(err); else resolve(result); }
-          );
-          Readable.from(buffer).pipe(stream);
-        });
-        results.pageImages.push(uploadResult.secure_url);
-      }
+    for (let pg = 1; pg <= pageCount; pg++) {
+      const pageUrl = cloudinaryImgUrl.replace(
+        '/upload/',
+        `/upload/pg_${pg},f_jpg,w_1200,q_85/`
+      );
+      results.pageImages.push(pageUrl);
     }
+    console.log(`[extractImagesFromPDF] ${pageCount} page image URLs generated.`);
   } catch (err) {
     console.warn('[extractImagesFromPDF] Page render failed:', err.message);
   }
@@ -318,8 +338,7 @@ const extractImagesFromPDF = async (pdfUrl, options = {}) => {
         const imgNames = new Set();
 
         opList.fnArray.forEach((fn, i) => {
-          // OPS.paintImageXObject = 85, paintInlineImageXObject = 83
-          if (fn === 85 || fn === 83) {
+          if (fn === 85 || fn === 83) { // paintImageXObject / paintInlineImageXObject
             imgNames.add(opList.argsArray[i]?.[0]);
           }
         });
@@ -335,10 +354,12 @@ const extractImagesFromPDF = async (pdfUrl, options = {}) => {
             const pngBuffer = await rgbaToPng(rgba, width, height);
 
             const uploadResult = await new Promise((resolve, reject) => {
-              cloudinary.uploader.upload_stream(
+              const { Readable } = require('stream');
+              const stream = cloudinary.uploader.upload_stream(
                 { resource_type: 'image', format: 'png', folder: 'notenexus/pdf-embedded' },
                 (err, result) => { if (err) reject(err); else resolve(result); }
-              )(pngBuffer);
+              );
+              Readable.from(pngBuffer).pipe(stream);
             });
 
             results.embeddedImages.push(uploadResult.secure_url);
@@ -362,66 +383,48 @@ const extractImagesFromPDF = async (pdfUrl, options = {}) => {
 };
 
 // ── Minimal RGBA → PNG encoder (no extra deps) ────────────────────────────────
-const rgbaToPng = (rgba, width, height) => {
-  return new Promise((resolve) => {
+const rgbaToPng = (rgba, width, height) =>
+  new Promise((resolve) => {
     const zlib = require('zlib');
 
     const sig  = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-
     const ihdr = Buffer.alloc(13);
     ihdr.writeUInt32BE(width,  0);
     ihdr.writeUInt32BE(height, 4);
-    ihdr[8]  = 8; // bit depth
-    ihdr[9]  = 2; // color type RGB
-    ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
 
     const makeChunk = (type, data) => {
       const typeBuf = Buffer.from(type, 'ascii');
       const len     = Buffer.alloc(4);
       len.writeUInt32BE(data.length, 0);
       const crcBuf  = Buffer.alloc(4);
-      const crc     = require('crc-32').buf(Buffer.concat([typeBuf, data])) >>> 0;
-      crcBuf.writeUInt32BE(crc, 0);
+      try {
+        const crc = require('crc-32').buf(Buffer.concat([typeBuf, data])) >>> 0;
+        crcBuf.writeUInt32BE(crc, 0);
+      } catch (_) { /* zero CRC fallback */ }
       return Buffer.concat([len, typeBuf, data, crcBuf]);
     };
 
-    // Build raw scanlines — filter byte 0 (None) per row, RGB only
     const raw = Buffer.alloc(height * (1 + width * 3));
     for (let y = 0; y < height; y++) {
       raw[y * (1 + width * 3)] = 0;
       for (let x = 0; x < width; x++) {
         const si = (y * width + x) * 4;
         const di = y * (1 + width * 3) + 1 + x * 3;
-        raw[di]     = rgba[si];
-        raw[di + 1] = rgba[si + 1];
-        raw[di + 2] = rgba[si + 2];
+        raw[di] = rgba[si]; raw[di + 1] = rgba[si + 1]; raw[di + 2] = rgba[si + 2];
       }
     }
 
     zlib.deflate(raw, (err, compressed) => {
       if (err) { resolve(Buffer.alloc(0)); return; }
-
-      const tryMakeChunk = (type, data) => {
-        try { return makeChunk(type, data); }
-        catch {
-          // Fallback: zero CRC (invalid but Cloudinary still decodes it)
-          const typeBuf = Buffer.from(type, 'ascii');
-          const len     = Buffer.alloc(4);
-          len.writeUInt32BE(data.length, 0);
-          const crcBuf  = Buffer.alloc(4);
-          return Buffer.concat([len, typeBuf, data, crcBuf]);
-        }
-      };
-
       resolve(Buffer.concat([
         sig,
-        tryMakeChunk('IHDR', ihdr),
-        tryMakeChunk('IDAT', compressed),
-        tryMakeChunk('IEND', Buffer.alloc(0)),
+        makeChunk('IHDR', ihdr),
+        makeChunk('IDAT', compressed),
+        makeChunk('IEND', Buffer.alloc(0)),
       ]));
     });
   });
-};
 
 module.exports = {
   extractFromPDF,
