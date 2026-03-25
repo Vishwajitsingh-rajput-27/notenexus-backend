@@ -292,7 +292,8 @@ router.post('/webhook', async (req, res) => {
     const text = (Body || '').trim().toLowerCase();
 
     // Find linked session
-    const session = await WhatsAppSession.findOne({ phoneNumber: from, isActive: true });
+    // FIX: model field is 'phone', not 'phoneNumber'
+    const session = await WhatsAppSession.findOne({ phone: from, isActive: true });
     if (!session) {
       // Check for link code
       const parts = text.split(' ');
@@ -300,7 +301,8 @@ router.post('/webhook', async (req, res) => {
         const code    = parts[1].toUpperCase();
         const linkDoc = await WhatsAppLinkCode.findOne({ code, used: false, expiresAt: { $gt: new Date() } });
         if (linkDoc) {
-          await WhatsAppSession.create({ userId: linkDoc.userId, phoneNumber: from, isActive: true });
+          // FIX: model field is 'phone', not 'phoneNumber'
+          await WhatsAppSession.create({ userId: linkDoc.userId, phone: from, isActive: true });
           await WhatsAppLinkCode.updateOne({ _id: linkDoc._id }, { used: true });
           await sendWhatsApp(from, '✅ *NoteNexus linked!*\n\nCommands:\n• *notes* — list your notes\n• *help* — full command list\n\nYou can also *send a PDF* or *image* directly here!');
         } else {
@@ -390,10 +392,11 @@ router.post('/webhook', async (req, res) => {
   }
 });
 
-// ─── REST endpoints (for dashboard UI) — unchanged ────────────────────────────
+// ─── REST endpoints (for dashboard UI) ────────────────────────────────────────
 
 // POST /api/whatsapp/generate-code  (protected)
-router.post('/generate-code', auth, async (req, res) => {
+// POST /api/whatsapp/generate-link-code  (FIX: frontend calls this URL)
+async function handleGenerateCode(req, res) {
   try {
     const code      = crypto.randomBytes(3).toString('hex').toUpperCase();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min
@@ -402,12 +405,34 @@ router.post('/generate-code', auth, async (req, res) => {
   } catch (err) {
     res.status(500).json({ message: 'Failed to generate code' });
   }
-});
+}
+router.post('/generate-code', auth, handleGenerateCode);
+// FIX: frontend calls /generate-link-code but route was only /generate-code
+router.post('/generate-link-code', auth, handleGenerateCode);
 
 // GET /api/whatsapp/status  (protected)
+// FIX: was missing 'configured' field that frontend checks for bot live status
 router.get('/status', auth, async (req, res) => {
+  const configured = !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_WHATSAPP_NUMBER);
+  const session    = await WhatsAppSession.findOne({ userId: req.user._id, isActive: true });
+  res.json({
+    configured,
+    linked: !!session,
+    // FIX: use session.phone (the actual model field), not session.phoneNumber
+    phone: session?.phone || null,
+    webhookUrl: configured ? `${process.env.BACKEND_URL || 'https://your-backend.com'}/api/whatsapp/webhook` : null,
+  });
+});
+
+// GET /api/whatsapp/link-status  (protected)
+// FIX: frontend calls /link-status but this endpoint was missing entirely
+router.get('/link-status', auth, async (req, res) => {
   const session = await WhatsAppSession.findOne({ userId: req.user._id, isActive: true });
-  res.json({ linked: !!session, phoneNumber: session?.phoneNumber || null });
+  res.json({
+    linked: !!session,
+    // FIX: use session.phone (the actual model field)
+    phone: session?.phone || null,
+  });
 });
 
 // DELETE /api/whatsapp/unlink  (protected)
